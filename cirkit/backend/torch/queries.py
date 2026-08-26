@@ -307,7 +307,9 @@ class CircuitWassersteinQuery(Query):
             metric_p: Exponent of the integer-line leaf ground cost. Gaussian
                 leaves require ``metric_p=2``.
             scale_factor: Positive divisor applied to leaf costs.
-            transport_solver: Optional OT backend for sum nodes and categorical leaves with ``metric_p != 1``
+            transport_solver: Optional batched OT backend for sum nodes and
+                categorical leaves with ``metric_p != 1``. It receives live
+                tensors and owns validation, device handling, and gradients.
             probability_atol: Absolute tolerance for built-in normalization checks.
             probability_rtol: Relative tolerance for built-in normalization checks.
         """

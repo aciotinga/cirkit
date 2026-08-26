@@ -9,7 +9,7 @@ from torch import Tensor
 
 from cirkit.backend.torch.circuits import TorchCircuit
 from cirkit.backend.torch.queries import CircuitWassersteinQuery
-from cirkit.backend.torch.wasserstein import HighsTransportSolver
+from cirkit.backend.torch.wasserstein import HighsTransportSolver, TransportSolver
 from cirkit.pipeline import PipelineContext
 from cirkit.templates import data_modalities, utils
 
@@ -18,15 +18,31 @@ PROFILE_RUNS = 5
 
 
 class ProfilingTransportSolver:
-    def __init__(self) -> None:
-        self.solver = HighsTransportSolver()
+    def __init__(self, solver: TransportSolver) -> None:
+        self.solver = solver
         self.times: dict[tuple[int, int], list[float]] = defaultdict(list)
+        self.problems: dict[tuple[int, int], int] = defaultdict(int)
 
     def __call__(self, cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
         start = time.perf_counter()
         value = self.solver(cost, supply, demand)
-        self.times[tuple(cost.shape)].append(time.perf_counter() - start)
+        shape = tuple(cost.shape[-2:])
+        self.times[shape].append(time.perf_counter() - start)
+        self.problems[shape] += cost[..., 0, 0].numel()
         return value
+
+    def close(self) -> None:
+        close = getattr(self.solver, "close", None)
+        if close is not None:
+            close()
+
+
+def make_transport_solver(name: str | None) -> TransportSolver:
+    if name in ("gurobi", "torch"):
+        from solver import GurobiTransportSolver, TorchTransportSolver
+
+        return GurobiTransportSolver() if name == "gurobi" else TorchTransportSolver()
+    return HighsTransportSolver(atol=1e-6, rtol=1e-5)
 
 
 def random_circuit(side: int, units: int) -> Any:
@@ -49,7 +65,13 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def profile(device: torch.device, side: int, units: int, profile_runs: int) -> None:
+def profile(
+    device: torch.device,
+    side: int,
+    units: int,
+    profile_runs: int,
+    solver_name: str | None,
+) -> None:
     pipeline: PipelineContext[TorchCircuit] = PipelineContext(
         backend="torch", fold=False, optimize=False
     )
@@ -63,7 +85,7 @@ def profile(device: torch.device, side: int, units: int, profile_runs: int) -> N
     synchronize(device)
     compile_seconds = time.perf_counter() - start
 
-    transport_solver = ProfilingTransportSolver()
+    transport_solver = ProfilingTransportSolver(make_transport_solver(solver_name))
     start = time.perf_counter()
     query = CircuitWassersteinQuery(circuit1, circuit2, transport_solver=transport_solver)
     query_seconds = time.perf_counter() - start
@@ -74,6 +96,7 @@ def profile(device: torch.device, side: int, units: int, profile_runs: int) -> N
         query().backward()
     synchronize(device)
     transport_solver.times.clear()
+    transport_solver.problems.clear()
 
     forward_times: list[float] = []
     backward_times: list[float] = []
@@ -97,10 +120,12 @@ def profile(device: torch.device, side: int, units: int, profile_runs: int) -> N
     total_times = [forward + backward for forward, backward in zip(forward_times, backward_times)]
     num_parameters = sum(parameter.numel() for parameter in circuit1.parameters())
     solver_seconds = sum(map(sum, transport_solver.times.values()))
-    solver_calls = sum(map(len, transport_solver.times.values()))
+    solver_batches = sum(map(len, transport_solver.times.values()))
+    solver_problems = sum(transport_solver.problems.values())
 
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
     print(f"Device:           {device_name}")
+    print(f"Solver:           {solver_name or 'default'}")
     print(f"Image:            {side}x{side}")
     print(f"Units/layer:      {units}")
     print(f"Layers:           {len(circuit1.layers):,}")
@@ -111,18 +136,20 @@ def profile(device: torch.device, side: int, units: int, profile_runs: int) -> N
     print(f"Backward median:  {statistics.median(backward_times):.4f} s")
     print(f"Total median:     {statistics.median(total_times):.4f} s")
     print(f"Total minimum:    {min(total_times):.4f} s")
-    print(f"Solver calls/run: {solver_calls / profile_runs:,.0f}")
+    print(f"Solver batches/run: {solver_batches / profile_runs:,.0f}")
+    print(f"Solver LPs/run:     {solver_problems / profile_runs:,.0f}")
     print(f"Solver time/run:  {solver_seconds / profile_runs:.4f} s")
     for shape, times in sorted(transport_solver.times.items()):
         print(
             f"  {shape[0]}x{shape[1]} LPs: "
-            f"{len(times) / profile_runs:,.0f}/run, {sum(times) / profile_runs:.4f} s/run"
+            f"{transport_solver.problems[shape] / profile_runs:,.0f} in "
+            f"{len(times) / profile_runs:,.0f} batches/run, "
+            f"{sum(times) / profile_runs:.4f} s/run"
         )
     if device.type == "cuda":
-        print(
-            f"Peak GPU memory:  {torch.cuda.max_memory_allocated(device) / 1024**2:.2f} MiB"
-        )
+        print(f"Peak GPU memory:  {torch.cuda.max_memory_allocated(device) / 1024**2:.2f} MiB")
     print(f"CW_p:             {cw.item():.6f}")
+    transport_solver.close()
 
 
 if __name__ == "__main__":
@@ -131,5 +158,6 @@ if __name__ == "__main__":
     parser.add_argument("--side", type=int, default=4)
     parser.add_argument("--units", type=int, default=1)
     parser.add_argument("--runs", type=int, default=PROFILE_RUNS)
+    parser.add_argument("--solver", choices=("gurobi", "torch"), default=None)
     args = parser.parse_args()
-    profile(torch.device(args.device), args.side, args.units, args.runs)
+    profile(torch.device(args.device), args.side, args.units, args.runs, args.solver)

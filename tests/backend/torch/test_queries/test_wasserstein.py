@@ -232,7 +232,7 @@ def test_categorical_w1_batches_all_unit_pairs():
     )
 
     assert torch.allclose(value, torch.tensor(0.38), atol=1e-12, rtol=1e-12)
-    assert solved_shapes == [(2, 2)]
+    assert solved_shapes == [(1, 1, 1, 2, 2)]
 
 
 def test_categorical_non_w1_uses_generic_transport_solver():
@@ -254,7 +254,7 @@ def test_categorical_non_w1_uses_generic_transport_solver():
     )
 
     assert torch.allclose(value, torch.tensor(0.5))
-    assert solved_shapes == [(2, 2)]
+    assert solved_shapes == [(1, 1, 2, 2)]
 
 
 def test_gaussian_w2_squared_and_scale():
@@ -309,7 +309,10 @@ def test_custom_solver_owns_sum_weight_validation():
         nonlocal calls
         calls += 1
         assert torch.allclose(supply.sum(), torch.tensor(1.1))
-        return torch.sum(cost * supply[:, None] * demand[None, :])
+        return torch.sum(
+            cost * supply[..., :, None] * demand[..., None, :],
+            dim=(-2, -1),
+        )
 
     value = circuit_wasserstein(
         ctx.compile(circuit1),
