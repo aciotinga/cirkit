@@ -290,6 +290,37 @@ def test_sum_recursion_matches_transport_reference():
     assert torch.allclose(value, torch.tensor(0.2495), atol=1e-12, rtol=1e-12)
 
 
+def test_custom_solver_owns_sum_weight_validation():
+    leaf_probs1, _ = parameter([[0.9, 0.1], [0.2, 0.8]])
+    leaf1 = CategoricalLayer(Scope([0]), 2, num_categories=2, probs=leaf_probs1)
+    weights1, _ = parameter([[0.8, 0.3]])
+    root1 = SumLayer(2, 1, weight=weights1)
+    circuit1 = Circuit([leaf1, root1], {root1: [leaf1]}, [root1])
+
+    leaf_probs2, _ = parameter([[0.8, 0.2], [0.1, 0.9]])
+    leaf2 = CategoricalLayer(Scope([0]), 2, num_categories=2, probs=leaf_probs2)
+    weights2, _ = parameter([[0.25, 0.75]])
+    root2 = SumLayer(2, 1, weight=weights2)
+    circuit2 = Circuit([leaf2, root2], {root2: [leaf2]}, [root2])
+    ctx = PipelineContext(backend="torch", fold=False, optimize=False)
+    calls = 0
+
+    def permissive_solver(cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
+        nonlocal calls
+        calls += 1
+        assert torch.allclose(supply.sum(), torch.tensor(1.1))
+        return torch.sum(cost * supply[:, None] * demand[None, :])
+
+    value = circuit_wasserstein(
+        ctx.compile(circuit1),
+        ctx.compile(circuit2),
+        transport_solver=permissive_solver,
+    )
+
+    assert torch.isfinite(value)
+    assert calls == 1
+
+
 def test_identity_and_symmetry():
     circuit1, _ = categorical_circuit([0.8, 0.2])
     circuit2, _ = categorical_circuit([0.3, 0.7])

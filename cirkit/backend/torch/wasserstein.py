@@ -24,10 +24,14 @@ from cirkit.utils.scope import Scope
 
 
 class TransportSolver(Protocol):
-    # Generic optimal transport solver (has to be balanced)
+    # Generic balanced optimal transport solver
 
     def __call__(self, cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
-        """Return the scalar transport value with gradients of the transport plan"""
+        """Solve transport from the live tensors supplied by the query.
+
+        The solver owns input validation, device transfers, and attaching the
+        transport plan and dual gradients to its scalar result.
+        """
 
 
 class HighsTransportSolver:
@@ -292,6 +296,18 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
             if key not in self._categorical_w1_cache:
                 probs1 = self._categorical_probabilities(0, layer1)
                 probs2 = self._categorical_probabilities(1, layer2)
+                _validate_probability_rows(
+                    probs1,
+                    "categorical probabilities",
+                    self.probability_atol,
+                    self.probability_rtol,
+                )
+                _validate_probability_rows(
+                    probs2,
+                    "categorical probabilities",
+                    self.probability_atol,
+                    self.probability_rtol,
+                )
                 num_categories = max(layer1.num_categories, layer2.num_categories)
                 probs1 = torch.nn.functional.pad(
                     probs1, (0, num_categories - layer1.num_categories)
@@ -412,26 +428,11 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
 
     def _categorical_probabilities(self, side: int, layer: TorchCategoricalLayer) -> Tensor:
         if layer.logits is not None:
-            probabilities = torch.softmax(self._parameter(side, layer, "logits"), dim=-1)
-        else:
-            probabilities = self._parameter(side, layer, "probs")
-        _validate_probability_rows(
-            probabilities,
-            "categorical probabilities",
-            self.probability_atol,
-            self.probability_rtol,
-        )
-        return probabilities
+            return torch.softmax(self._parameter(side, layer, "logits"), dim=-1)
+        return self._parameter(side, layer, "probs")
 
     def _sum_weights(self, side: int, layer: TorchSumLayer) -> Tensor:
-        weights = self._parameter(side, layer, "weight")
-        _validate_probability_rows(
-            weights,
-            "sum weights",
-            self.probability_atol,
-            self.probability_rtol,
-        )
-        return weights
+        return self._parameter(side, layer, "weight")
 
     def _sum_children(self, side: int, layer: TorchSumLayer) -> list[tuple[TorchLayer, int]]:
         return [
