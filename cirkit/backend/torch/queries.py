@@ -7,7 +7,17 @@ from torch import Tensor
 
 from cirkit.backend.torch.circuits import TorchCircuit
 from cirkit.backend.torch.layers import TorchInnerLayer, TorchInputLayer, TorchLayer
+from cirkit.backend.torch.wasserstein import TransportSolver, _build_engine
+from cirkit.backend.torch.wasserstein import circuit_wasserstein as circuit_wasserstein
 from cirkit.utils.scope import Scope
+
+__all__ = [
+    "CircuitWassersteinQuery",
+    "IntegrateQuery",
+    "Query",
+    "SamplingQuery",
+    "circuit_wasserstein",
+]
 
 
 class Query(ABC):
@@ -273,3 +283,61 @@ class SamplingQuery(Query):
         fold_idx = torch.arange(samples.shape[0], device=samples.device)
         padded_samples[fold_idx, :, :, scope_idx.squeeze(dim=1)] = samples
         return padded_samples
+
+
+class CircuitWassersteinQuery(Query):
+    """Exact differentiable Circuit-Wasserstein between two Torch circuits."""
+
+    def __init__(
+        self,
+        circuit1: TorchCircuit,
+        circuit2: TorchCircuit,
+        *,
+        metric_p: float = 1.0,
+        scale_factor: float = 1.0,
+        transport_solver: TransportSolver | None = None,
+        probability_atol: float = 1e-6,
+        probability_rtol: float = 1e-5,
+    ) -> None:
+        """Initialize a Circuit-Wasserstein query.
+
+        Args:
+            circuit1: First unfolded Torch circuit.
+            circuit2: Second unfolded Torch circuit.
+            metric_p: Exponent of the integer-line leaf ground cost. Gaussian
+                leaves require ``metric_p=2``.
+            scale_factor: Positive divisor applied to leaf costs.
+            transport_solver: Optional balanced OT backend.
+            probability_atol: Absolute tolerance for normalization checks.
+            probability_rtol: Relative tolerance for normalization checks.
+        """
+
+        super().__init__()
+        self._circuit1 = circuit1
+        self._circuit2 = circuit2
+        self._engine = _build_engine(
+            circuit1,
+            circuit2,
+            metric_p=metric_p,
+            scale_factor=scale_factor,
+            transport_solver=transport_solver,
+            probability_atol=probability_atol,
+            probability_rtol=probability_rtol,
+        )
+
+    @property
+    def circuit1(self) -> TorchCircuit:
+        """Retrieve the first Torch circuit used by the query."""
+
+        return self._circuit1
+
+    @property
+    def circuit2(self) -> TorchCircuit:
+        """Retrieve the second Torch circuit used by the query."""
+
+        return self._circuit2
+
+    def __call__(self) -> Tensor:
+        """Compute ``CW_p`` from the current live parameter values."""
+
+        return self._engine()
