@@ -138,10 +138,14 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
             dict[tuple[TorchLayer, str], Tensor],
             dict[tuple[TorchLayer, str], Tensor],
         ]
+        self._categorical_w1_cache: dict[
+            tuple[TorchCategoricalLayer, TorchCategoricalLayer], Tensor
+        ]
         self._reference_tensor: Tensor | None
 
     def __call__(self) -> Tensor:
         self._parameter_cache = ({}, {})
+        self._categorical_w1_cache = {}
         self._reference_tensor = None
         memo: dict[tuple[TorchLayer, int, TorchLayer, int], Tensor] = {}
         return self._couple(
@@ -283,7 +287,27 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
         layer2: TorchCategoricalLayer,
         unit2: int,
     ) -> Tensor:
-        # Solve discrete OT
+        if self.metric_p == 1.0:
+            key = (layer1, layer2)
+            if key not in self._categorical_w1_cache:
+                probs1 = self._categorical_probabilities(0, layer1)
+                probs2 = self._categorical_probabilities(1, layer2)
+                num_categories = max(layer1.num_categories, layer2.num_categories)
+                probs1 = torch.nn.functional.pad(
+                    probs1, (0, num_categories - layer1.num_categories)
+                )
+                probs2 = torch.nn.functional.pad(
+                    probs2, (0, num_categories - layer2.num_categories)
+                )
+                cdf1 = torch.cumsum(probs1, dim=-1)
+                cdf2 = torch.cumsum(probs2, dim=-1)
+                self._categorical_w1_cache[key] = (
+                    torch.abs(cdf1[:, None, :-1] - cdf2[None, :, :-1]).sum(dim=-1)
+                    / self.scale_factor
+                )
+            return self._categorical_w1_cache[key][unit1, unit2]
+
+        # Fall back to generic discrete OT for other ground-cost exponents
         probs1 = self._categorical_probabilities(0, layer1)[unit1]
         probs2 = self._categorical_probabilities(1, layer2)[unit2]
         support1 = torch.arange(layer1.num_categories, device=probs1.device, dtype=probs1.dtype)
@@ -513,8 +537,9 @@ def circuit_wasserstein(
 ) -> Tensor:
     """Compute exact ``CW_p`` between two unfolded Torch circuits.
 
-    HiGHS solves each transport LP on CPU and autograd receives the selected
-    first-order LP subgradient.
+    Categorical ``W_1`` leaves are evaluated natively on their parameter device.
+    HiGHS solves the remaining transport LPs on CPU and autograd receives the
+    selected first-order LP subgradient.
     """
 
     engine = _build_engine(

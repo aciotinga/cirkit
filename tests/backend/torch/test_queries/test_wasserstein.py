@@ -7,7 +7,7 @@ from torch import Tensor
 
 from cirkit.backend.torch.compiler import TorchCompiler
 from cirkit.backend.torch.queries import CircuitWassersteinQuery
-from cirkit.backend.torch.wasserstein import circuit_wasserstein
+from cirkit.backend.torch.wasserstein import HighsTransportSolver, circuit_wasserstein
 from cirkit.pipeline import PipelineContext
 from cirkit.symbolic.circuit import Circuit
 from cirkit.symbolic.initializers import ConstantTensorInitializer
@@ -194,6 +194,67 @@ def test_categorical_matches_reference_value():
 
     # The optimal leaf coupling moves mass 0.5 by distance 1.
     assert torch.allclose(value, torch.tensor(0.5))
+
+
+def test_categorical_w1_handles_different_support_sizes_and_scale_without_solver():
+    circuit1, _ = categorical_circuit([0.25, 0.75])
+    circuit2, _ = categorical_circuit([0.25, 0.25, 0.5])
+    ctx = PipelineContext(backend="torch", fold=False, optimize=False)
+
+    def unexpected_solver(cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
+        raise AssertionError("Categorical W1 should not call the generic transport solver")
+
+    value = circuit_wasserstein(
+        ctx.compile(circuit1),
+        ctx.compile(circuit2),
+        scale_factor=2.0,
+        transport_solver=unexpected_solver,
+    )
+
+    assert torch.allclose(value, torch.tensor(0.25))
+
+
+def test_categorical_w1_batches_all_unit_pairs():
+    circuit1, _ = mixture_circuit([[0.9, 0.1], [0.2, 0.8]], [0.65, 0.35])
+    circuit2, _ = mixture_circuit([[0.8, 0.2], [0.1, 0.9]], [0.25, 0.75])
+    ctx = PipelineContext(backend="torch", fold=False, optimize=False)
+    solver = HighsTransportSolver()
+    solved_shapes: list[tuple[int, int]] = []
+
+    def recording_solver(cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
+        solved_shapes.append(tuple(cost.shape))
+        return solver(cost, supply, demand)
+
+    value = circuit_wasserstein(
+        ctx.compile(circuit1),
+        ctx.compile(circuit2),
+        transport_solver=recording_solver,
+    )
+
+    assert torch.allclose(value, torch.tensor(0.38), atol=1e-12, rtol=1e-12)
+    assert solved_shapes == [(2, 2)]
+
+
+def test_categorical_non_w1_uses_generic_transport_solver():
+    circuit1, _ = categorical_circuit([0.75, 0.25])
+    circuit2, _ = categorical_circuit([0.25, 0.75])
+    ctx = PipelineContext(backend="torch", fold=False, optimize=False)
+    solver = HighsTransportSolver()
+    solved_shapes: list[tuple[int, int]] = []
+
+    def recording_solver(cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
+        solved_shapes.append(tuple(cost.shape))
+        return solver(cost, supply, demand)
+
+    value = circuit_wasserstein(
+        ctx.compile(circuit1),
+        ctx.compile(circuit2),
+        metric_p=2.0,
+        transport_solver=recording_solver,
+    )
+
+    assert torch.allclose(value, torch.tensor(0.5))
+    assert solved_shapes == [(2, 2)]
 
 
 def test_gaussian_w2_squared_and_scale():
