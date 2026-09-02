@@ -502,8 +502,13 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
         values: dict[LayerPair, Tensor],
     ) -> Tensor:
         result: Tensor | None = None
+        identity_units = isinstance(layer1, TorchHadamardLayer) and isinstance(
+            layer2, TorchHadamardLayer
+        )
         for dependency, units1, units2 in self._product_specs[(layer1, layer2)]:
-            child_values = values[dependency][list(units1)][:, list(units2)]
+            child_values = values[dependency]
+            if not identity_units:
+                child_values = child_values[list(units1)][:, list(units2)]
             result = child_values if result is None else result + child_values
         assert result is not None
         return result

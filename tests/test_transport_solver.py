@@ -2,11 +2,14 @@ import pytest
 import torch
 
 from cirkit.backend.torch.wasserstein import HighsTransportSolver
-from solver import TorchTransportSolver
+from solver import TorchTransportSolver, TorchTransportSolver2
 
 
+@pytest.mark.parametrize("solver_type", [TorchTransportSolver, TorchTransportSolver2])
 @pytest.mark.parametrize("num_units", [4, 8])
-def test_torch_transport_solver_matches_highs_value_and_gradients(num_units: int):
+def test_torch_transport_solver_matches_highs_value_and_gradients(
+    num_units: int, solver_type: type[TorchTransportSolver] | type[TorchTransportSolver2]
+):
     with torch.enable_grad():
         torch.manual_seed(0)
         cost = torch.rand((3, num_units, num_units), dtype=torch.float64, requires_grad=True)
@@ -21,7 +24,7 @@ def test_torch_transport_solver_matches_highs_value_and_gradients(num_units: int
         expected_gradients = torch.autograd.grad(
             expected.sum(), (cost, supply, demand), retain_graph=True
         )
-        actual = TorchTransportSolver(validate=True)(cost, supply, demand)
+        actual = solver_type(validate=True)(cost, supply, demand)
         actual_gradients = torch.autograd.grad(actual.sum(), (cost, supply, demand))
 
         assert torch.allclose(actual, expected, atol=1e-12, rtol=1e-12)

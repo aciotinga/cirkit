@@ -39,13 +39,13 @@ class ProfilingTransportSolver:
 
 def make_transport_solver(name: str | None) -> TransportSolver:
     if name in ("gurobi", "torch", "torch-ip"):
-        from solver import GurobiTransportSolver, TorchTransportSolver2, TorchTransportSolver
-        if name == "torch-ip":
-            return TorchTransportSolver2()
+        from solver import GurobiTransportSolver, TorchTransportSolver, TorchTransportSolver2
+
         if name == "gurobi":
             return GurobiTransportSolver()
-        if name == "torch":
-            return TorchTransportSolver()
+        if name == "torch-ip":
+            return TorchTransportSolver2()
+        return TorchTransportSolver()
     return HighsTransportSolver(atol=1e-6, rtol=1e-5)
 
 
@@ -69,12 +69,31 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def print_profiler_summary(prof: torch.profiler.profile, top_k: int = 20) -> None:
+    print("\n--- torch.profiler (sorted by self CUDA time) ---")
+    print(
+        prof.key_averages().table(
+            sort_by="self_cuda_time_total",
+            row_limit=top_k,
+        )
+    )
+    print("\n--- torch.profiler (sorted by total CUDA time) ---")
+    print(
+        prof.key_averages().table(
+            sort_by="cuda_time_total",
+            row_limit=top_k,
+        )
+    )
+
+
 def profile(
     device: torch.device,
     side: int,
     units: int,
     profile_runs: int,
     solver_name: str | None,
+    *,
+    use_profiler: bool = False,
 ) -> None:
     pipeline: PipelineContext[TorchCircuit] = PipelineContext(
         backend="torch", fold=False, optimize=False
@@ -136,13 +155,21 @@ def profile(
     print(f"Parameters:       {num_parameters:,}")
     print(f"Compile:          {compile_seconds:.4f} s")
     print(f"Query setup:      {query_seconds:.4f} s")
-    print(f"Forward median:   {statistics.median(forward_times):.4f} s")
-    print(f"Backward median:  {statistics.median(backward_times):.4f} s")
+    forward_median = statistics.median(forward_times)
+    backward_median = statistics.median(backward_times)
+    print(f"Forward median:   {forward_median:.4f} s")
+    print(f"Backward median:  {backward_median:.4f} s")
+    print(f"Backward/Forward: {backward_median / forward_median:.2f}x")
     print(f"Total median:     {statistics.median(total_times):.4f} s")
     print(f"Total minimum:    {min(total_times):.4f} s")
     print(f"Solver batches/run: {solver_batches / profile_runs:,.0f}")
     print(f"Solver LPs/run:     {solver_problems / profile_runs:,.0f}")
-    print(f"Solver time/run:  {solver_seconds / profile_runs:.4f} s")
+    solver_time_per_run = solver_seconds / profile_runs
+    print(f"Solver time/run:  {solver_time_per_run:.4f} s")
+    print(
+        f"Solver share:     {100 * solver_time_per_run / forward_median:.1f}% of forward, "
+        f"{100 * solver_time_per_run / (forward_median + backward_median):.1f}% of total"
+    )
     for shape, times in sorted(transport_solver.times.items()):
         print(
             f"  {shape[0]}x{shape[1]} LPs: "
@@ -153,6 +180,24 @@ def profile(
     if device.type == "cuda":
         print(f"Peak GPU memory:  {torch.cuda.max_memory_allocated(device) / 1024**2:.2f} MiB")
     print(f"CW_p:             {cw.item():.6f}")
+
+    if use_profiler:
+        circuit1.zero_grad(set_to_none=True)
+        circuit2.zero_grad(set_to_none=True)
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            with_stack=False,
+        ) as prof:
+            cw = query()
+            cw.backward()
+        synchronize(device)
+        print_profiler_summary(prof)
+
     transport_solver.close()
 
 
@@ -162,6 +207,14 @@ if __name__ == "__main__":
     parser.add_argument("--side", type=int, default=4)
     parser.add_argument("--units", type=int, default=1)
     parser.add_argument("--runs", type=int, default=PROFILE_RUNS)
-    parser.add_argument("--solver", choices=("gurobi", "torch", "torch-ip"), default=None)
+    parser.add_argument("--solver", choices=("gurobi", "torch", "torch-ip"), default="torch-ip")
+    parser.add_argument("--profiler", action="store_true")
     args = parser.parse_args()
-    profile(torch.device(args.device), args.side, args.units, args.runs, args.solver)
+    profile(
+        torch.device(args.device),
+        args.side,
+        args.units,
+        args.runs,
+        args.solver,
+        use_profiler=args.profiler,
+    )

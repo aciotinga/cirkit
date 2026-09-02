@@ -52,153 +52,7 @@ def _transport_constraints(n: int, m: int) -> np.ndarray:
                 constraints[n + j, edge] = 1.0
     return constraints
 
-
 class TorchTransportSolver:
-    """Exact batched transport using device-native revised simplex."""
-
-    def __init__(
-        self,
-        *,
-        feasibility_atol: float = 1e-7,
-        optimality_atol: float = 1e-7,
-        max_simplex_iterations: int = 256,
-        validate: bool = False,
-    ) -> None:
-        self.feasibility_atol = feasibility_atol
-        self.optimality_atol = optimality_atol
-        self.max_simplex_iterations = max_simplex_iterations
-        self.validate = validate
-        self._device_constraints: dict[tuple[int, int, torch.device, torch.dtype], Tensor] = {}
-
-    def __call__(self, cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
-        if self.validate:
-            self._validate(cost, supply, demand)
-        batch_shape = cost.shape[:-2]
-        n, m = cost.shape[-2:]
-        num_edges = n * m
-        batch_size = math.prod(batch_shape) if batch_shape else 1
-
-        with torch.no_grad():
-            flat_cost = cost.detach().reshape(batch_size, num_edges)
-            flat_supply = supply.detach().reshape(batch_size, n)
-            flat_demand = demand.detach().reshape(batch_size, m)
-            plan, dual, value = self._solve_simplex(flat_cost, flat_supply, flat_demand, n, m)
-
-        plan = plan.reshape(*batch_shape, n, m)
-        row_dual = dual[:, :n].reshape(*batch_shape, n)
-        column_dual = cost.new_zeros((batch_size, m))
-        column_dual[:, :-1] = dual[:, n:]
-        column_dual = column_dual.reshape(*batch_shape, m)
-        value = value.reshape(batch_shape)
-        return _TransportValue.apply(cost, supply, demand, value, plan, row_dual, column_dual)
-
-    def _solve_simplex(
-        self,
-        cost: Tensor,
-        supply: Tensor,
-        demand: Tensor,
-        n: int,
-        m: int,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        batch_size = cost.shape[0]
-        num_constraints = n + m - 1
-        num_edges = n * m
-        key = (n, m, cost.device, cost.dtype)
-        if key not in self._device_constraints:
-            self._device_constraints[key] = torch.as_tensor(
-                _transport_constraints(n, m), device=cost.device, dtype=cost.dtype
-            )
-        constraints = self._device_constraints[key]
-        edge_constraints = constraints.T
-
-        plan = cost.new_zeros((batch_size, num_edges))
-        basis = torch.empty((batch_size, num_constraints), device=cost.device, dtype=torch.long)
-        remaining_supply = supply.clone()
-        remaining_demand = demand.clone()
-        rows = torch.zeros(batch_size, device=cost.device, dtype=torch.long)
-        columns = torch.zeros(batch_size, device=cost.device, dtype=torch.long)
-        batches = torch.arange(batch_size, device=cost.device)
-        for position in range(num_constraints):
-            edges = rows * m + columns
-            basis[:, position] = edges
-            supply_values = remaining_supply[batches, rows]
-            demand_values = remaining_demand[batches, columns]
-            flow = torch.minimum(supply_values, demand_values)
-            plan[batches, edges] = flow
-            remaining_supply[batches, rows] = torch.clamp_min(supply_values - flow, 0.0)
-            remaining_demand[batches, columns] = torch.clamp_min(demand_values - flow, 0.0)
-            advance_row = supply_values <= demand_values
-            rows = rows + advance_row
-            columns = columns + ~advance_row
-
-        dual: Tensor | None = None
-        for _ in range(self.max_simplex_iterations):
-            basis_transpose = edge_constraints[basis]
-            basis_cost = torch.gather(cost, 1, basis)
-            dual = torch.linalg.solve(basis_transpose, basis_cost)
-            reduced_cost = cost - dual @ constraints
-            reduced_cost.scatter_(1, basis, torch.inf)
-            entering = torch.argmin(reduced_cost, dim=-1)
-            active = reduced_cost[batches, entering] < -self.optimality_atol
-            if not torch.any(active).item():
-                break
-
-            entering_constraints = edge_constraints[entering]
-            direction = torch.linalg.solve(
-                basis_transpose.transpose(-2, -1),
-                -entering_constraints.unsqueeze(-1),
-            ).squeeze(-1)
-            basis_flow = torch.gather(plan, 1, basis)
-            ratios = torch.where(
-                direction < -self.feasibility_atol,
-                basis_flow / -direction,
-                torch.inf,
-            )
-            leaving_position = torch.argmin(ratios, dim=-1)
-            theta = ratios[batches, leaving_position]
-            theta = torch.where(active, theta, torch.zeros_like(theta))
-
-            plan.scatter_(1, basis, basis_flow + theta[:, None] * direction)
-            plan[batches, entering] += theta
-            active_batches = batches[active]
-            leaving_edges = basis[active_batches, leaving_position[active]]
-            plan[active_batches, leaving_edges] = 0.0
-            basis[active_batches, leaving_position[active]] = entering[active]
-        else:
-            raise RuntimeError(
-                f"Transport simplex did not converge in {self.max_simplex_iterations} iterations"
-            )
-
-        assert dual is not None
-        value = torch.sum(cost * plan, dim=-1)
-        return plan, dual, value
-
-    @staticmethod
-    def _validate(cost: Tensor, supply: Tensor, demand: Tensor) -> None:
-        if cost.ndim < 2:
-            raise ValueError(f"Expected batched cost matrices, found shape {cost.shape}")
-        batch_shape = cost.shape[:-2]
-        n, m = cost.shape[-2:]
-        if supply.shape != (*batch_shape, n) or demand.shape != (*batch_shape, m):
-            raise ValueError("Transport marginals do not match the cost batch")
-        if cost.device != supply.device or cost.device != demand.device:
-            raise ValueError("Transport inputs must be on the same device")
-        if cost.dtype != supply.dtype or cost.dtype != demand.dtype:
-            raise ValueError("Transport inputs must have the same dtype")
-        if not torch.all(torch.isfinite(cost)).item() or torch.any(cost < 0.0).item():
-            raise ValueError("Transport costs must be finite and non-negative")
-        for marginal in (supply, demand):
-            if (
-                not torch.all(torch.isfinite(marginal)).item()
-                or torch.any(marginal < 0.0).item()
-                or not torch.allclose(
-                    marginal.sum(dim=-1),
-                    torch.ones_like(marginal[..., 0]),
-                )
-            ):
-                raise ValueError("Transport marginals must be probability vectors")
-
-class TorchTransportSolver2:
     """Exact batched transport using device-native revised simplex."""
 
     def __init__(
@@ -334,6 +188,175 @@ class TorchTransportSolver2:
             leave_edge = basis[act_idx, leaving_pos[active]]
             plan[act_idx, leave_edge] = 0.0
             basis[act_idx, leaving_pos[active]] = entering[active]
+        else:
+            raise RuntimeError(
+                f"Transport simplex did not converge in {self.max_simplex_iterations} iterations"
+            )
+
+        value = (cost * plan).sum(dim=-1)
+        return plan, dual, value
+
+    @staticmethod
+    def _validate(cost: Tensor, supply: Tensor, demand: Tensor) -> None:
+        if cost.ndim < 2:
+            raise ValueError(f"Expected batched cost matrices, found shape {cost.shape}")
+        batch_shape = cost.shape[:-2]
+        n, m = cost.shape[-2:]
+        if supply.shape != (*batch_shape, n) or demand.shape != (*batch_shape, m):
+            raise ValueError("Transport marginals do not match the cost batch")
+        if cost.device != supply.device or cost.device != demand.device:
+            raise ValueError("Transport inputs must be on the same device")
+        if cost.dtype != supply.dtype or cost.dtype != demand.dtype:
+            raise ValueError("Transport inputs must have the same dtype")
+        if not torch.isfinite(cost).all() or (cost < 0).any():
+            raise ValueError("Transport costs must be finite and non-negative")
+        for marg in (supply, demand):
+            if (
+                not torch.isfinite(marg).all()
+                or (marg < 0).any()
+                or not torch.allclose(marg.sum(-1), torch.ones_like(marg[..., 0]))
+            ):
+                raise ValueError("Transport marginals must be probability vectors")
+
+class TorchTransportSolver2:
+    """Exact batched transport using device-native revised simplex."""
+
+    def __init__(
+        self,
+        *,
+        feasibility_atol: float = 1e-7,
+        optimality_atol: float = 1e-7,
+        max_simplex_iterations: int = 256,
+        validate: bool = False,
+    ) -> None:
+        self.feasibility_atol = feasibility_atol
+        self.optimality_atol = optimality_atol
+        self.max_simplex_iterations = max_simplex_iterations
+        self.validate = validate
+        self._device_constraints: dict[tuple[int, int, torch.device, torch.dtype], Tensor] = {}
+
+    def __call__(self, cost: Tensor, supply: Tensor, demand: Tensor) -> Tensor:
+        if self.validate:
+            self._validate(cost, supply, demand)
+
+        batch_shape = cost.shape[:-2]
+        n, m = cost.shape[-2:]
+        num_edges = n * m
+        batch_size = int(math.prod(batch_shape)) if batch_shape else 1
+
+        with torch.no_grad():
+            flat_cost = cost.reshape(batch_size, num_edges)
+            flat_supply = supply.reshape(batch_size, n)
+            flat_demand = demand.reshape(batch_size, m)
+            plan, dual, value = self._solve_simplex(
+                flat_cost, flat_supply, flat_demand, n, m
+            )
+
+        plan = plan.view(*batch_shape, n, m)
+        row_dual = dual[:, :n].view(*batch_shape, n)
+        column_dual = cost.new_zeros(batch_size, m)
+        column_dual[:, :-1] = dual[:, n:]
+        column_dual = column_dual.view(*batch_shape, m)
+        value = value.view(batch_shape)
+        return _TransportValue.apply(cost, supply, demand, value, plan, row_dual, column_dual)
+
+    def _solve_simplex(
+        self,
+        cost: Tensor,
+        supply: Tensor,
+        demand: Tensor,
+        n: int,
+        m: int,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        batch_size = cost.shape[0]
+        num_constraints = n + m - 1
+        num_edges = n * m
+        device = cost.device
+        dtype = cost.dtype
+
+        key = (n, m, device, dtype)
+        constraints = self._device_constraints.get(key)
+        if constraints is None:
+            constraints = torch.as_tensor(
+                _transport_constraints(n, m), device=device, dtype=dtype
+            )  # (R, E)
+            self._device_constraints[key] = constraints
+        edge_constraints = constraints.T  # (E, R) – contiguous for gather
+
+        # ---------- Northwest-corner initial basic feasible solution ----------
+        plan = cost.new_zeros(batch_size, num_edges)
+        basis = torch.empty(batch_size, num_constraints, device=device, dtype=torch.long)
+
+        rem_s = supply.clone()
+        rem_d = demand.clone()
+        rows = torch.zeros(batch_size, device=device, dtype=torch.long)
+        cols = torch.zeros(batch_size, device=device, dtype=torch.long)
+        batches = torch.arange(batch_size, device=device)
+
+        # Unrolled / tight loop – num_constraints is tiny (≤ ~30 for practical n,m)
+        for pos in range(num_constraints):
+            edges = rows * m + cols
+            basis[:, pos] = edges
+            s_val = rem_s[batches, rows]
+            d_val = rem_d[batches, cols]
+            flow = torch.minimum(s_val, d_val)
+            plan[batches, edges] = flow
+            rem_s[batches, rows] = (s_val - flow).clamp_min_(0.0)
+            rem_d[batches, cols] = (d_val - flow).clamp_min_(0.0)
+            advance_row = s_val <= d_val
+            rows += advance_row
+            cols += ~advance_row
+
+        # ---------- Revised simplex iterations ----------
+        dual = None
+        for _ in range(self.max_simplex_iterations):
+            # B = edge_constraints[basis]  →  (B, R, R)
+            B = edge_constraints[basis]  # advanced indexing is fused
+
+            basis_cost = cost.gather(1, basis)  # (B, R)
+            LU, pivots, _ = torch.linalg.lu_factor_ex(B, check_errors=False)
+            dual = torch.linalg.lu_solve(
+                LU, pivots, basis_cost.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # reduced cost = c - dual @ A
+            reduced = cost - dual @ constraints  # (B, E)
+            reduced.scatter_(1, basis, torch.inf)  # basic variables never enter
+
+            entering = reduced.argmin(dim=-1)  # (B,)
+            rc_enter = reduced[batches, entering]
+            active = rc_enter < -self.optimality_atol
+
+            # Early exit without Python branch on the hot path when possible
+            if not active.any():
+                break
+
+            # Direction: solve B^T d = -A_e
+            Ae = edge_constraints[entering]  # (B, R)
+            direction = torch.linalg.lu_solve(
+                LU, pivots, -Ae.unsqueeze(-1), adjoint=True
+            ).squeeze(-1)  # (B, R)
+
+            basis_flow = plan.gather(1, basis)  # (B, R)
+            # Ratio test
+            ratios = torch.where(
+                direction < -self.feasibility_atol,
+                basis_flow / -direction,
+                torch.full_like(basis_flow, torch.inf),
+            )
+            leaving_pos = ratios.argmin(dim=-1)  # (B,)
+            theta = ratios[batches, leaving_pos]
+            theta = torch.where(active, theta, torch.zeros_like(theta))
+
+            # Update plan in-place
+            plan.scatter_(1, basis, basis_flow + theta.unsqueeze(1) * direction)
+            plan[batches, entering] += theta
+
+            # Pivot only active problems
+            leave_edge = basis[batches, leaving_pos]
+            leave_flow = plan[batches, leave_edge]
+            plan[batches, leave_edge] = leave_flow.masked_fill(active, 0.0)
+            basis[batches, leaving_pos] = torch.where(active, entering, leave_edge)
         else:
             raise RuntimeError(
                 f"Transport simplex did not converge in {self.max_simplex_iterations} iterations"
