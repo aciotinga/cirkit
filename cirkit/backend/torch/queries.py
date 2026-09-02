@@ -7,7 +7,7 @@ from torch import Tensor
 
 from cirkit.backend.torch.circuits import TorchCircuit
 from cirkit.backend.torch.layers import TorchInnerLayer, TorchInputLayer, TorchLayer
-from cirkit.backend.torch.wasserstein import TransportSolver, _build_engine
+from cirkit.backend.torch.wasserstein import TransportSolver, TorchTransportSolver, _build_engine
 from cirkit.backend.torch.wasserstein import circuit_wasserstein as circuit_wasserstein
 from cirkit.utils.scope import Scope
 
@@ -16,6 +16,7 @@ __all__ = [
     "IntegrateQuery",
     "Query",
     "SamplingQuery",
+    "TorchTransportSolver",
     "circuit_wasserstein",
 ]
 
@@ -308,8 +309,8 @@ class CircuitWassersteinQuery(Query):
                 leaves require ``metric_p=2``.
             scale_factor: Positive divisor applied to leaf costs.
             transport_solver: Optional batched OT backend for sum nodes and
-                categorical leaves with ``metric_p != 1``. It receives live
-                tensors and owns validation, device handling, and gradients.
+                categorical leaves with ``metric_p != 1``. Defaults to
+                ``TorchTransportSolver`` on the parameter device.
             probability_atol: Absolute tolerance for built-in normalization checks.
             probability_rtol: Relative tolerance for built-in normalization checks.
         """
