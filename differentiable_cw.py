@@ -38,10 +38,14 @@ class ProfilingTransportSolver:
 
 
 def make_transport_solver(name: str | None) -> TransportSolver:
-    if name in ("gurobi", "torch"):
-        from solver import GurobiTransportSolver, TorchTransportSolver
-
-        return GurobiTransportSolver() if name == "gurobi" else TorchTransportSolver()
+    if name in ("gurobi", "torch", "torch-ip"):
+        from solver import GurobiTransportSolver, TorchTransportSolver2, TorchTransportSolver
+        if name == "torch-ip":
+            return TorchTransportSolver2()
+        if name == "gurobi":
+            return GurobiTransportSolver()
+        if name == "torch":
+            return TorchTransportSolver()
     return HighsTransportSolver(atol=1e-6, rtol=1e-5)
 
 
@@ -158,6 +162,6 @@ if __name__ == "__main__":
     parser.add_argument("--side", type=int, default=4)
     parser.add_argument("--units", type=int, default=1)
     parser.add_argument("--runs", type=int, default=PROFILE_RUNS)
-    parser.add_argument("--solver", choices=("gurobi", "torch"), default=None)
+    parser.add_argument("--solver", choices=("gurobi", "torch", "torch-ip"), default=None)
     args = parser.parse_args()
     profile(torch.device(args.device), args.side, args.units, args.runs, args.solver)
