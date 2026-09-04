@@ -359,6 +359,257 @@ TorchProductLayer = TorchHadamardLayer | TorchKroneckerLayer
 LayerPair = tuple[TorchLayer, TorchLayer]
 
 
+def _same_fold_index(indices1: list[Any], indices2: list[Any]) -> bool:
+    if len(indices1) != len(indices2):
+        return False
+    for index1, index2 in zip(indices1, indices2):
+        if isinstance(index1, Tensor) and isinstance(index2, Tensor):
+            if not torch.equal(index1.cpu(), index2.cpu()):
+                return False
+        elif type(index1) is not type(index2) or index1 != index2:
+            return False
+    return True
+
+
+def _product_unit_indices(layer: TorchProductLayer, child_index: int) -> list[int]:
+    if isinstance(layer, TorchHadamardLayer):
+        return list(range(layer.num_output_units))
+    stride = layer.num_input_units ** (layer.arity - child_index - 1)
+    return [
+        (unit // stride) % layer.num_input_units for unit in range(layer.num_output_units)
+    ]
+
+
+class _FoldedCircuitWassersteinEngine:
+    """Vectorized CW evaluation for identically folded circuit structures."""
+
+    def __init__(
+        self,
+        circuit1: TorchCircuit,
+        circuit2: TorchCircuit,
+        *,
+        metric_p: float,
+        scale_factor: float,
+        transport_solver: TransportSolver,
+        probability_atol: float,
+        probability_rtol: float,
+    ) -> None:
+        assert metric_p > 0.0, "metric_p must be positive"
+        assert scale_factor > 0.0, "scale_factor must be positive"
+        assert probability_atol >= 0.0 and probability_rtol >= 0.0
+        self.circuits = (circuit1, circuit2)
+        self.metric_p = metric_p
+        self.scale_factor = scale_factor
+        self.transport_solver = transport_solver
+        self.probability_atol = probability_atol
+        self.probability_rtol = probability_rtol
+        self._reference_tensor: Tensor | None = None
+        self._output_layer, self._output_fold = self._validate_circuits()
+
+    def __call__(self) -> Tensor:
+        self._reference_tensor = None
+        values: list[Tensor] = []
+        entries = list(self.circuits[0].address_book)
+        for layer1, layer2, entry in zip(
+            self.circuits[0].layers, self.circuits[1].layers, entries
+        ):
+            if isinstance(layer1, TorchInputLayer):
+                assert isinstance(layer2, TorchInputLayer)
+                value = self._input_matrix(layer1, layer2)
+            else:
+                children = self._gather_inputs(values, entry)
+                if isinstance(layer1, TorchSumLayer):
+                    assert isinstance(layer2, TorchSumLayer)
+                    value = self._sum_matrix(layer1, layer2, children)
+                else:
+                    assert isinstance(layer1, (TorchHadamardLayer, TorchKroneckerLayer))
+                    assert isinstance(layer2, (TorchHadamardLayer, TorchKroneckerLayer))
+                    value = self._product_matrix(layer1, layer2, children)
+            values.append(value)
+        return values[self._output_layer][self._output_fold, 0, 0]
+
+    @staticmethod
+    def _gather_inputs(values: list[Tensor], entry: Any) -> Tensor:
+        (input_ids,) = entry.in_module_ids
+        inputs = (
+            values[input_ids[0]]
+            if len(input_ids) == 1
+            else torch.cat([values[index] for index in input_ids])
+        )
+        (fold_index,) = entry.in_fold_idx
+        return inputs[fold_index]
+
+    def _input_matrix(self, layer1: TorchInputLayer, layer2: TorchInputLayer) -> Tensor:
+        if isinstance(layer1, TorchCategoricalLayer) and isinstance(
+            layer2, TorchCategoricalLayer
+        ):
+            probs1 = self._categorical_probabilities(layer1)
+            probs2 = self._categorical_probabilities(layer2)
+            _validate_probability_rows(
+                probs1, "categorical probabilities", self.probability_atol, self.probability_rtol
+            )
+            _validate_probability_rows(
+                probs2, "categorical probabilities", self.probability_atol, self.probability_rtol
+            )
+            num_categories = max(probs1.shape[-1], probs2.shape[-1])
+            probs1 = torch.nn.functional.pad(probs1, (0, num_categories - probs1.shape[-1]))
+            probs2 = torch.nn.functional.pad(probs2, (0, num_categories - probs2.shape[-1]))
+            if self.metric_p == 1.0:
+                cdf1 = torch.cumsum(probs1, dim=-1)
+                cdf2 = torch.cumsum(probs2, dim=-1)
+                return (
+                    torch.abs(cdf1[:, :, None, :-1] - cdf2[:, None, :, :-1]).sum(dim=-1)
+                    / self.scale_factor
+                )
+            support = torch.arange(num_categories, device=probs1.device, dtype=probs1.dtype)
+            cost = torch.abs(support[:, None] - support[None, :]).pow(self.metric_p)
+            num_folds, num_units1 = probs1.shape[:2]
+            num_units2 = probs2.shape[1]
+            return self.transport_solver(
+                cost.expand(num_folds, num_units1, num_units2, -1, -1) / self.scale_factor,
+                probs1[:, :, None].expand(-1, -1, num_units2, -1),
+                probs2[:, None].expand(-1, num_units1, -1, -1),
+            )
+
+        assert isinstance(layer1, TorchGaussianLayer)
+        assert isinstance(layer2, TorchGaussianLayer)
+        if layer1.log_partition is not None or layer2.log_partition is not None:
+            raise ValueError("Circuit-Wasserstein requires normalized Gaussian leaves")
+        mean1 = self._parameter(layer1, "mean")
+        mean2 = self._parameter(layer2, "mean")
+        stddev1 = self._parameter(layer1, "stddev")
+        stddev2 = self._parameter(layer2, "stddev")
+        for value, name in (
+            (mean1, "Gaussian mean"),
+            (mean2, "Gaussian mean"),
+            (stddev1, "Gaussian stddev"),
+            (stddev2, "Gaussian stddev"),
+        ):
+            if not torch.all(torch.isfinite(value)).item():
+                raise ValueError(f"{name} must be finite")
+        if torch.any(stddev1 <= 0.0).item() or torch.any(stddev2 <= 0.0).item():
+            raise ValueError("Gaussian standard deviations must be positive")
+        return (
+            torch.square(mean1[:, :, None] - mean2[:, None, :])
+            + torch.square(stddev1[:, :, None] - stddev2[:, None, :])
+        ) / self.scale_factor
+
+    def _sum_matrix(
+        self, layer1: TorchSumLayer, layer2: TorchSumLayer, children: Tensor
+    ) -> Tensor:
+        if children.shape[1] != 1:
+            raise RuntimeError("Aligned folded Circuit-Wasserstein requires unary sum layers")
+        cost = children[:, 0]
+        weights1 = self._parameter(layer1, "weight")
+        weights2 = self._parameter(layer2, "weight")
+        num_units1, num_units2 = weights1.shape[1], weights2.shape[1]
+        return self.transport_solver(
+            cost[:, None, None].expand(-1, num_units1, num_units2, -1, -1),
+            weights1[:, :, None].expand(-1, -1, num_units2, -1),
+            weights2[:, None].expand(-1, num_units1, -1, -1),
+        )
+
+    @staticmethod
+    def _product_matrix(
+        layer1: TorchProductLayer, layer2: TorchProductLayer, children: Tensor
+    ) -> Tensor:
+        if isinstance(layer1, TorchHadamardLayer) and isinstance(layer2, TorchHadamardLayer):
+            return children.sum(dim=1)
+
+        result: Tensor | None = None
+        for child_index in range(layer1.arity):
+            units1 = _product_unit_indices(layer1, child_index)
+            units2 = _product_unit_indices(layer2, child_index)
+            child = children[:, child_index][:, units1][:, :, units2]
+            result = child if result is None else result + child
+        assert result is not None
+        return result
+
+    def _categorical_probabilities(self, layer: TorchCategoricalLayer) -> Tensor:
+        if layer.logits is not None:
+            return torch.softmax(self._parameter(layer, "logits"), dim=-1)
+        return self._parameter(layer, "probs")
+
+    def _parameter(self, layer: TorchLayer, name: str) -> Tensor:
+        value = layer.params[name]()
+        if value.shape[0] != layer.num_folds:
+            raise ValueError("Circuit parameter folds do not match their layer")
+        if not value.is_floating_point():
+            raise ValueError("Circuit parameters must be floating-point tensors")
+        if self._reference_tensor is None:
+            self._reference_tensor = value
+        elif (
+            value.device != self._reference_tensor.device
+            or value.dtype != self._reference_tensor.dtype
+        ):
+            raise ValueError("Both circuits must use the same parameter device and dtype")
+        return value
+
+    def _validate_circuits(self) -> tuple[int, int]:
+        circuit1, circuit2 = self.circuits
+        for index, circuit in enumerate(self.circuits, 1):
+            if not circuit.is_folded:
+                raise ValueError(f"Circuit {index} is not folded")
+            if (
+                not circuit.properties.smooth
+                or not circuit.properties.decomposable
+                or not circuit.properties.structured_decomposable
+            ):
+                raise ValueError(
+                    f"Circuit {index} must be smooth and structured-decomposable, "
+                    f"found {circuit.properties}"
+                )
+            if len(circuit.outputs) != 1 or circuit.outputs[0].num_output_units != 1:
+                raise ValueError(f"Circuit {index} must have exactly one scalar output")
+        if circuit1.scope != circuit2.scope:
+            raise ValueError("Circuits must have identical scopes")
+        if len(circuit1.layers) != len(circuit2.layers):
+            raise ValueError("Folded circuits must have aligned layer structures")
+
+        entries1 = list(circuit1.address_book)
+        entries2 = list(circuit2.address_book)
+        for layer1, layer2, entry1, entry2 in zip(
+            circuit1.layers, circuit2.layers, entries1, entries2
+        ):
+            if layer1.num_folds != layer2.num_folds:
+                raise ValueError("Folded circuits must have aligned folds")
+            if entry1.in_module_ids != entry2.in_module_ids or not _same_fold_index(
+                entry1.in_fold_idx, entry2.in_fold_idx
+            ):
+                raise ValueError("Folded circuits must have aligned connectivity")
+            if isinstance(layer1, TorchInputLayer) and isinstance(layer2, TorchInputLayer):
+                if type(layer1) is not type(layer2):
+                    raise ValueError("Paired folded input layers have different operations")
+                if not torch.equal(layer1.scope_idx.cpu(), layer2.scope_idx.cpu()):
+                    raise ValueError("Paired folded input layers have different scopes")
+                if isinstance(layer1, TorchGaussianLayer) and self.metric_p != 2.0:
+                    raise ValueError("Gaussian Circuit-Wasserstein requires metric_p=2")
+            elif isinstance(layer1, TorchSumLayer) and isinstance(layer2, TorchSumLayer):
+                if layer1.arity != 1 or layer2.arity != 1:
+                    raise NotImplementedError(
+                        "Folded Circuit-Wasserstein currently requires unary sum layers; "
+                        "compile with fold=False for general sum structures"
+                    )
+            elif isinstance(layer1, (TorchHadamardLayer, TorchKroneckerLayer)) and isinstance(
+                layer2, (TorchHadamardLayer, TorchKroneckerLayer)
+            ):
+                if layer1.arity != layer2.arity:
+                    raise ValueError("Paired folded products have different arities")
+            else:
+                raise ValueError("Paired folded layers have different operations")
+
+        output1, output2 = entries1[-1], entries2[-1]
+        if output1.in_module_ids != output2.in_module_ids or not _same_fold_index(
+            output1.in_fold_idx, output2.in_fold_idx
+        ):
+            raise ValueError("Folded circuits must have aligned outputs")
+        (output_ids,) = output1.in_module_ids
+        (output_index,) = output1.in_fold_idx
+        if len(output_ids) != 1 or not isinstance(output_index, Tensor) or output_index.numel() != 1:
+            raise ValueError("Folded Circuit-Wasserstein requires one aligned output fold")
+        return output_ids[0], int(output_index.item())
+
+
 class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
     # Bottom-up CW evaluation over pairs of unfolded Torch circuit layers
 
@@ -922,10 +1173,15 @@ def _build_engine(
     transport_solver: TransportSolver | None,
     probability_atol: float,
     probability_rtol: float,
-) -> _CircuitWassersteinEngine:
+) -> _CircuitWassersteinEngine | _FoldedCircuitWassersteinEngine:
     if transport_solver is None:
         transport_solver = TorchTransportSolver()
-    return _CircuitWassersteinEngine(
+    if circuit1.is_folded != circuit2.is_folded:
+        raise ValueError("Circuit-Wasserstein requires both circuits to use the same fold mode")
+    engine_type = (
+        _FoldedCircuitWassersteinEngine if circuit1.is_folded else _CircuitWassersteinEngine
+    )
+    return engine_type(
         circuit1,
         circuit2,
         metric_p=metric_p,
@@ -946,11 +1202,12 @@ def circuit_wasserstein(
     probability_atol: float = 1e-6,
     probability_rtol: float = 1e-5,
 ) -> Tensor:
-    """Compute exact ``CW_p`` between two unfolded Torch circuits.
+    """Compute exact ``CW_p`` between two Torch circuits.
 
     Categorical ``W_1`` leaves are evaluated natively on their parameter device.
     Remaining transport LPs are solved on-device by ``TorchTransportSolver`` and
-    autograd receives the selected first-order LP subgradient.
+    autograd receives the selected first-order LP subgradient. Folded circuits
+    must have aligned connectivity and unary sum layers.
     """
 
     engine = _build_engine(

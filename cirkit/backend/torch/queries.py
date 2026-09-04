@@ -303,8 +303,8 @@ class CircuitWassersteinQuery(Query):
         """Initialize a Circuit-Wasserstein query.
 
         Args:
-            circuit1: First unfolded Torch circuit.
-            circuit2: Second unfolded Torch circuit.
+            circuit1: First Torch circuit.
+            circuit2: Second Torch circuit using the same fold mode.
             metric_p: Exponent of the integer-line leaf ground cost. Gaussian
                 leaves require ``metric_p=2``.
             scale_factor: Positive divisor applied to leaf costs.

@@ -98,7 +98,7 @@ def profile(
     use_profiler: bool = False,
 ) -> None:
     pipeline: PipelineContext[TorchCircuit] = PipelineContext(
-        backend="torch", fold=False, optimize=False
+        backend="torch", fold=True, optimize=False
     )
 
     synchronize(device)

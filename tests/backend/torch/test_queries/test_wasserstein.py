@@ -568,13 +568,42 @@ def test_rejects_mixed_leaf_families_and_non_scalar_outputs():
         circuit_wasserstein(torch_vector, torch_vector)
 
 
-def test_rejects_folded_or_fused_torch_layers():
-    circuit1, _ = mixture_circuit([[0.9, 0.1], [0.2, 0.8]], [0.65, 0.35], product="hadamard")
-    circuit2, _ = mixture_circuit([[0.8, 0.2], [0.1, 0.9]], [0.25, 0.75], product="hadamard")
+@pytest.mark.parametrize("product", ["hadamard", "kronecker"])
+def test_folded_matches_unfolded_and_rejects_fused_torch_layers(product: str):
+    weights1 = [0.65, 0.35] if product == "hadamard" else [0.4, 0.3, 0.2, 0.1]
+    weights2 = [0.25, 0.75] if product == "hadamard" else [0.1, 0.2, 0.3, 0.4]
+    circuit1, parameters1 = mixture_circuit(
+        [[0.9, 0.1], [0.2, 0.8]], weights1, product=product
+    )
+    circuit2, parameters2 = mixture_circuit(
+        [[0.8, 0.2], [0.1, 0.9]], weights2, product=product
+    )
+    raw_parameters = [*parameters1.values(), *parameters2.values()]
+
+    unfolded_ctx = PipelineContext(backend="torch", fold=False, optimize=False)
+    unfolded1 = unfolded_ctx.compile(circuit1)
+    unfolded2 = unfolded_ctx.compile(circuit2)
+    expected = circuit_wasserstein(unfolded1, unfolded2)
+    expected.backward()
+    expected_gradients = [
+        tensor.grad[fold_idx].clone()
+        for raw in raw_parameters
+        for tensor, fold_idx in [raw_compiled_parameter(unfolded_ctx, raw)]
+    ]
 
     folded_ctx = PipelineContext(backend="torch", fold=True, optimize=False)
-    with pytest.raises(ValueError, match="unfolded Torch circuits"):
-        circuit_wasserstein(folded_ctx.compile(circuit1), folded_ctx.compile(circuit2))
+    folded1 = folded_ctx.compile(circuit1)
+    folded2 = folded_ctx.compile(circuit2)
+    actual = circuit_wasserstein(folded1, folded2)
+
+    assert torch.allclose(actual, expected)
+    actual.backward()
+    for raw, expected_gradient in zip(raw_parameters, expected_gradients):
+        tensor, fold_idx = raw_compiled_parameter(folded_ctx, raw)
+        assert torch.allclose(tensor.grad[fold_idx], expected_gradient)
+
+    with pytest.raises(ValueError, match="same fold mode"):
+        circuit_wasserstein(folded1, unfolded2)
 
     fused_ctx = PipelineContext(backend="torch", fold=False, optimize=True)
     with pytest.raises(NotImplementedError, match="Unsupported Torch layer"):
@@ -582,10 +611,11 @@ def test_rejects_folded_or_fused_torch_layers():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_query_preserves_cuda_device():
+@pytest.mark.parametrize("fold", [False, True])
+def test_query_preserves_cuda_device(fold: bool):
     circuit1, _ = categorical_circuit([0.8, 0.2])
     circuit2, _ = categorical_circuit([0.3, 0.7])
-    ctx = PipelineContext(backend="torch", fold=False, optimize=False)
+    ctx = PipelineContext(backend="torch", fold=fold, optimize=False)
     query = CircuitWassersteinQuery(ctx.compile(circuit1), ctx.compile(circuit2))
     query.circuit1.to("cuda")
     query.circuit2.to("cuda")
