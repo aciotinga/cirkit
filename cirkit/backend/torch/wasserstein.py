@@ -640,8 +640,7 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
                 torch.abs(cdf1[:, :, None, :-1] - cdf2[:, None, :, :-1]).sum(dim=-1)
                 / self.scale_factor
             )
-            for index, pair in enumerate(group):
-                values[pair] = distances[index]
+            values.update(zip(group, distances.unbind()))
 
     def _categorical_matrix(
         self, layer1: TorchCategoricalLayer, layer2: TorchCategoricalLayer
@@ -746,34 +745,37 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
                 )
             ].append((layer1, layer2))
 
-        for group in groups.values():
+        for (num_units1, num_units2, _, _), group in groups.items():
             costs: list[Tensor] = []
             supplies: list[Tensor] = []
             demands: list[Tensor] = []
             for layer1, layer2 in group:
                 inputs1 = self.circuits[0].layer_inputs(layer1)
                 inputs2 = self.circuits[1].layer_inputs(layer2)
-                cost = torch.cat(
-                    [
-                        torch.cat([values[(child1, child2)] for child2 in inputs2], dim=1)
-                        for child1 in inputs1
-                    ],
-                    dim=0,
-                )
-                weights1 = self._sum_weights(0, layer1)
-                weights2 = self._sum_weights(1, layer2)
-                num_units1, num_units2 = weights1.shape[0], weights2.shape[0]
-                costs.append(cost.expand(num_units1, num_units2, -1, -1))
-                supplies.append(weights1[:, None, :].expand(-1, num_units2, -1))
-                demands.append(weights2[None, :, :].expand(num_units1, -1, -1))
+                if len(inputs1) == len(inputs2) == 1:
+                    cost = values[(inputs1[0], inputs2[0])]
+                else:
+                    cost = torch.cat(
+                        [
+                            torch.cat(
+                                [values[(child1, child2)] for child2 in inputs2], dim=1
+                            )
+                            for child1 in inputs1
+                        ],
+                        dim=0,
+                    )
+                costs.append(cost)
+                supplies.append(self._sum_weights(0, layer1))
+                demands.append(self._sum_weights(1, layer2))
 
             results = self.transport_solver(
-                torch.stack(costs),
-                torch.stack(supplies),
-                torch.stack(demands),
+                torch.stack(costs)[:, None, None].expand(
+                    -1, num_units1, num_units2, -1, -1
+                ),
+                torch.stack(supplies)[:, :, None].expand(-1, -1, num_units2, -1),
+                torch.stack(demands)[:, None].expand(-1, num_units1, -1, -1),
             )
-            for index, pair in enumerate(group):
-                values[pair] = results[index]
+            values.update(zip(group, results.unbind()))
 
     def _build_batched_softmax_groups(
         self,
@@ -808,8 +810,7 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
             values = torch.softmax(raw, dim=dim + 1)
             self._register_parameter_tensor(values)
             self._parameter_cache[side].update(
-                ((layer, name), values[index])
-                for index, (layer, name, _) in enumerate(group)
+                zip(((layer, name) for layer, name, _ in group), values.unbind())
             )
 
     def _parameter(self, side: int, layer: TorchLayer, name: str) -> Tensor:
