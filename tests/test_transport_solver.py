@@ -26,3 +26,16 @@ def test_torch_transport_solver_matches_highs_value_and_gradients(num_units: int
         assert torch.allclose(actual, expected, atol=1e-12, rtol=1e-12)
         for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
             assert torch.allclose(actual_gradient, expected_gradient, atol=1e-12, rtol=1e-12)
+
+
+def test_torch_transport_solver_handles_degenerate_initial_basis():
+    with torch.enable_grad():
+        cost = torch.tensor([[[0.0, 1.0], [1.0, 0.0]]], requires_grad=True)
+        supply = torch.tensor([[0.5, 0.5]], requires_grad=True)
+        demand = torch.tensor([[0.5, 0.5]], requires_grad=True)
+
+        value = TorchTransportSolver(validate=True)(cost, supply, demand)
+        gradients = torch.autograd.grad(value.sum(), (cost, supply, demand))
+
+        assert torch.equal(value, torch.zeros(1))
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)

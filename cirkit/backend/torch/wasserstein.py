@@ -22,6 +22,7 @@ from cirkit.backend.torch.layers import (
     TorchLayer,
     TorchSumLayer,
 )
+from cirkit.backend.torch.parameters.nodes import TorchSoftmaxParameter, TorchTensorParameter
 from cirkit.utils.scope import Scope
 
 
@@ -256,8 +257,12 @@ class TorchTransportSolver:
             plan[batches, edges] = flow
             rem_s[batches, rows] = (s_val - flow).clamp_min_(0.0)
             rem_d[batches, cols] = (d_val - flow).clamp_min_(0.0)
-            rows += rem_s[batches, rows] == 0
-            cols += rem_d[batches, cols] == 0
+            row_empty = rem_s[batches, rows] == 0
+            column_empty = rem_d[batches, cols] == 0
+            # On a tie, advance one axis so the next zero-flow edge keeps the basis full rank.
+            advance_row = row_empty & (~column_empty | (rows < n - 1))
+            rows += advance_row
+            cols += column_empty & ~advance_row
             rows.clamp_(max=n - 1)
             cols.clamp_(max=m - 1)
 
@@ -388,6 +393,7 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
             (circuit1.outputs[0], circuit2.outputs[0])
         )
         self._product_specs = self._build_product_specs()
+        self._batched_softmax_groups = self._build_batched_softmax_groups()
         self._parameter_cache: tuple[
             dict[tuple[TorchLayer, str], Tensor],
             dict[tuple[TorchLayer, str], Tensor],
@@ -397,6 +403,7 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
     def __call__(self) -> Tensor:
         self._parameter_cache = ({}, {})
         self._reference_tensor = None
+        self._evaluate_batched_softmaxes()
         values: dict[LayerPair, Tensor] = {}
         for level in self._levels:
             input_pairs: list[tuple[TorchInputLayer, TorchInputLayer]] = []
@@ -768,6 +775,43 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
             for index, pair in enumerate(group):
                 values[pair] = results[index]
 
+    def _build_batched_softmax_groups(
+        self,
+    ) -> list[tuple[int, int, list[tuple[TorchLayer, str, TorchTensorParameter]]]]:
+        groups: dict[
+            tuple[int, tuple[int, ...], int],
+            list[tuple[TorchLayer, str, TorchTensorParameter]],
+        ] = defaultdict(list)
+        for side, circuit in enumerate(self.circuits):
+            for layer in circuit.layers:
+                for name, parameter in layer.params.items():
+                    nodes = list(parameter.nodes)
+                    if (
+                        len(nodes) == 2
+                        and isinstance(nodes[0], TorchTensorParameter)
+                        and isinstance(nodes[1], TorchSoftmaxParameter)
+                    ):
+                        groups[(side, parameter.shape, nodes[1].dim)].append(
+                            (layer, name, nodes[0])
+                        )
+        return [
+            (side, dim, group)
+            for (side, _, dim), group in groups.items()
+            if len(group) > 1
+        ]
+
+    def _evaluate_batched_softmaxes(self) -> None:
+        for side, dim, group in self._batched_softmax_groups:
+            raw = torch.cat(
+                [next(node.parameters(recurse=False)) for _, _, node in group]
+            )
+            values = torch.softmax(raw, dim=dim + 1)
+            self._register_parameter_tensor(values)
+            self._parameter_cache[side].update(
+                ((layer, name), values[index])
+                for index, (layer, name, _) in enumerate(group)
+            )
+
     def _parameter(self, side: int, layer: TorchLayer, name: str) -> Tensor:
         key = (layer, name)
         cache = self._parameter_cache[side]
@@ -776,17 +820,20 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
             if value.shape[0] != 1:
                 raise ValueError("Circuit-Wasserstein requires unfolded parameters")
             value = value[0]
-            if not value.is_floating_point():
-                raise ValueError("Circuit parameters must be floating-point tensors")
-            if self._reference_tensor is None:
-                self._reference_tensor = value
-            elif (
-                value.device != self._reference_tensor.device
-                or value.dtype != self._reference_tensor.dtype
-            ):
-                raise ValueError("Both circuits must use the same parameter device and dtype")
+            self._register_parameter_tensor(value)
             cache[key] = value
         return cache[key]
+
+    def _register_parameter_tensor(self, value: Tensor) -> None:
+        if not value.is_floating_point():
+            raise ValueError("Circuit parameters must be floating-point tensors")
+        if self._reference_tensor is None:
+            self._reference_tensor = value
+        elif (
+            value.device != self._reference_tensor.device
+            or value.dtype != self._reference_tensor.dtype
+        ):
+            raise ValueError("Both circuits must use the same parameter device and dtype")
 
     def _categorical_probabilities(self, side: int, layer: TorchCategoricalLayer) -> Tensor:
         if layer.logits is not None:
