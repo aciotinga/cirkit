@@ -229,6 +229,9 @@ class TorchTransportSolver:
         num_edges = n * m
         device = cost.device
         dtype = cost.dtype
+        numerical_optimality_atol = (
+            num_constraints * torch.finfo(dtype).eps * cost.abs().amax(dim=-1)
+        )
 
         key = (n, m, device, dtype)
         constraints = self._device_constraints.get(key)
@@ -267,7 +270,7 @@ class TorchTransportSolver:
             cols.clamp_(max=m - 1)
 
         dual = None
-        for _ in range(self.max_simplex_iterations):
+        for iteration in range(self.max_simplex_iterations):
             B = edge_constraints[basis]
             basis_cost = cost.gather(1, basis)
             LU, pivots, _ = torch.linalg.lu_factor_ex(B, check_errors=False)
@@ -276,9 +279,18 @@ class TorchTransportSolver:
             reduced = cost - dual @ constraints
             reduced.scatter_(1, basis, torch.inf)
 
-            entering = reduced.argmin(dim=-1)
-            rc_enter = reduced[batches, entering]
-            active = rc_enter < -self.optimality_atol
+            # Use the fast Dantzig rule normally, then Bland's rule to break rare cycles.
+            if iteration < num_edges:
+                entering = reduced.argmin(dim=-1)
+                active = reduced[batches, entering] < -(
+                    self.optimality_atol + numerical_optimality_atol
+                )
+            else:
+                improving = reduced < -(
+                    self.optimality_atol + numerical_optimality_atol[:, None]
+                )
+                entering = improving.to(torch.int8).argmax(dim=-1)
+                active = improving[batches, entering]
             if not active.any():
                 break
 
@@ -293,7 +305,12 @@ class TorchTransportSolver:
                 basis_flow / -direction,
                 torch.full_like(basis_flow, torch.inf),
             )
-            leaving_pos = ratios.argmin(dim=-1)
+            if iteration < num_edges:
+                leaving_pos = ratios.argmin(dim=-1)
+            else:
+                minimum_ratio = ratios.amin(dim=-1, keepdim=True)
+                leaving_edges = basis.masked_fill(ratios != minimum_ratio, num_edges)
+                leaving_pos = leaving_edges.argmin(dim=-1)
             theta = ratios[batches, leaving_pos]
             theta = torch.where(active, theta, torch.zeros_like(theta))
 

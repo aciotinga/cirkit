@@ -39,3 +39,20 @@ def test_torch_transport_solver_handles_degenerate_initial_basis():
 
         assert torch.equal(value, torch.zeros(1))
         assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+def test_torch_transport_solver_handles_large_additive_costs():
+    torch.manual_seed(0)
+    batch_size = 128
+    row_cost = torch.rand(batch_size, 4, 1) * 1e6
+    column_cost = torch.rand(batch_size, 1, 4) * 1e6
+    cost = row_cost + column_cost
+    supply = torch.softmax(torch.randn(batch_size, 4), dim=-1)
+    demand = torch.softmax(torch.randn(batch_size, 4), dim=-1)
+
+    actual = TorchTransportSolver(max_simplex_iterations=32)(cost, supply, demand)
+    expected = (row_cost.squeeze(-1) * supply).sum(-1) + (
+        column_cost.squeeze(-2) * demand
+    ).sum(-1)
+
+    assert torch.allclose(actual, expected, atol=1.0, rtol=2e-6)
