@@ -421,6 +421,63 @@ class HadamardParameter(BinaryParameterOp):
         return self.in_shape1
 
 
+class SumPartitionParameter(BinaryParameterOp):
+    """A symbolic parameter operator computing the partition vector of a unary sum layer.
+
+    Given a weight matrix ``W`` of shape ``(K, J)`` and a child partition vector ``z`` of
+    shape ``(J,)``, this operator computes ``z_parent = W @ z``.
+    """
+
+    def __init__(self, in_shape1: tuple[int, ...], in_shape2: tuple[int, ...]):
+        """Initializes a symbolic sum-partition parameter operator.
+
+        Args:
+            in_shape1: The shape of the sum-layer weight matrix ``W``.
+            in_shape2: The shape of the child partition vector ``z``.
+        """
+        if len(in_shape1) != 2:
+            raise ValueError(f"Expected a matrix weight shape, found {in_shape1}")
+        if in_shape2 != (in_shape1[1],):
+            raise ValueError(
+                "Expected the child partition shape to be "
+                f"{(in_shape1[1],)}, found {in_shape2}"
+            )
+        super().__init__(in_shape1, in_shape2)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (self.in_shape1[0],)
+
+
+class NormalizeSumParameter(BinaryParameterOp):
+    """A symbolic parameter operator that normalizes unary sum weights by a child partition.
+
+    Given a weight matrix ``W`` of shape ``(K, J)`` and a child partition vector ``z`` of
+    shape ``(J,)``, this operator computes
+    ``W_normalized[k, j] = W[k, j] * z[j] / (W @ z)[k]``.
+    """
+
+    def __init__(self, in_shape1: tuple[int, ...], in_shape2: tuple[int, ...]):
+        """Initializes a symbolic sum-normalization parameter operator.
+
+        Args:
+            in_shape1: The shape of the sum-layer weight matrix ``W``.
+            in_shape2: The shape of the child partition vector ``z``.
+        """
+        if len(in_shape1) != 2:
+            raise ValueError(f"Expected a matrix weight shape, found {in_shape1}")
+        if in_shape2 != (in_shape1[1],):
+            raise ValueError(
+                "Expected the child partition shape to be "
+                f"{(in_shape1[1],)}, found {in_shape2}"
+            )
+        super().__init__(in_shape1, in_shape2)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.in_shape1
+
+
 class KroneckerParameter(BinaryParameterOp):
     """A symbolic parameter operator representing the Kronecker product of its inputs."""
 

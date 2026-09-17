@@ -15,7 +15,10 @@ from cirkit.symbolic.circuit import (
     are_compatible,
 )
 from cirkit.symbolic.layers import (
+    CategoricalLayer,
+    ConstantValueLayer,
     EvidenceLayer,
+    HadamardLayer,
     InputLayer,
     KroneckerLayer,
     Layer,
@@ -23,7 +26,18 @@ from cirkit.symbolic.layers import (
     ProductLayer,
     SumLayer,
 )
-from cirkit.symbolic.parameters import ConstantParameter, Parameter
+from cirkit.symbolic.parameters import (
+    ConstantParameter,
+    ExpParameter,
+    HadamardParameter,
+    LogParameter,
+    NormalizeSumParameter,
+    Parameter,
+    ReduceLSEParameter,
+    ReduceSumParameter,
+    SoftmaxParameter,
+    SumPartitionParameter,
+)
 from cirkit.symbolic.registry import OPERATOR_REGISTRY, OperatorRegistry
 from cirkit.utils.scope import Scope
 
@@ -649,3 +663,199 @@ def conjugate(
         output_blocks,
         operation=CircuitOperation(operator=CircuitOperator.CONJUGATION, operands=(sc,)),
     )
+
+
+def _parameter_hadamard(partitions: Sequence[Parameter]) -> Parameter:
+    product = partitions[0]
+    for partition in partitions[1:]:
+        if product.shape != partition.shape:
+            raise ValueError(
+                "Hadamard child partitions must have the same shape, "
+                f"found {product.shape} and {partition.shape}"
+            )
+        product = Parameter.from_binary(
+            HadamardParameter(product.shape, partition.shape),
+            product,
+            partition,
+        )
+    return product
+
+
+def _categorical_partition_and_probs(sl: CategoricalLayer) -> tuple[Parameter, Parameter]:
+    if sl.probs is not None:
+        partition = Parameter.from_unary(ReduceSumParameter(sl.probs.shape, axis=1), sl.probs.ref())
+        probs = Parameter.from_unary(
+            SoftmaxParameter(sl.probs.shape),
+            Parameter.from_unary(LogParameter(sl.probs.shape), sl.probs.ref()),
+        )
+        return partition, probs
+    if sl.logits is None:
+        raise ValueError("Categorical layer has neither probabilities nor logits")
+    lse = ReduceLSEParameter(sl.logits.shape, axis=1)
+    partition = Parameter.from_sequence(sl.logits.ref(), lse, ExpParameter(lse.shape))
+    probs = Parameter.from_unary(SoftmaxParameter(sl.logits.shape), sl.logits.ref())
+    return partition, probs
+
+
+def _constant_partition(sl: ConstantValueLayer) -> Parameter:
+    value = sl.value.ref()
+    if sl.log_space:
+        return Parameter.from_unary(ExpParameter(value.shape), value)
+    return value
+
+
+def normalize(sc: Circuit) -> Circuit:
+    r"""Normalize a categorical CP circuit by folding empty-scope constants into parameters.
+
+    This operator is defined for the circuit family produced by
+    ``tabular_data(..., region_graph="random-binary-tree", sum_product_layer="cp")``,
+    together with [multiply][cirkit.symbolic.functional.multiply] and
+    [integrate][cirkit.symbolic.functional.integrate]:
+    [CategoricalLayer][cirkit.symbolic.layers.CategoricalLayer], unary
+    [SumLayer][cirkit.symbolic.layers.SumLayer],
+    [HadamardLayer][cirkit.symbolic.layers.HadamardLayer], and marginalized
+    [ConstantValueLayer][cirkit.symbolic.layers.ConstantValueLayer].
+
+    The rewrite computes a partition vector $z$ bottom-up and locally renormalizes each layer.
+    Empty-scope branches evaluate to one after local normalization and are omitted. A Hadamard
+    layer with a single surviving child is bypassed. The resulting circuit $c'$ satisfies
+    $c'(\mathbf{x}) = c(\mathbf{x}) / Z$ on the remaining variables, where $Z$ is the partition
+    of $c$. Learnable parameters of $c$ are preserved through symbolic references.
+
+    Args:
+        sc: A symbolic circuit.
+
+    Returns:
+        The normalized symbolic circuit.
+
+    Raises:
+        StructuralPropertyError: If the given circuit is not smooth and decomposable,
+            or if the rewritten circuit is not.
+        ValueError: If the circuit contains unsupported layers, n-ary sums, empty outputs,
+            or malformed probabilistic parameters.
+    """
+    if not sc.is_smooth or not sc.is_decomposable:
+        raise StructuralPropertyError(
+            "Only smooth and decomposable circuits can be efficiently normalized."
+        )
+
+    layers_to_block: dict[Layer, CircuitBlock | None] = {}
+    partitions: dict[Layer, Parameter] = {}
+    empty_layers: set[Layer] = set()
+    blocks: list[CircuitBlock] = []
+    in_blocks: dict[CircuitBlock, list[CircuitBlock]] = {}
+
+    for sl in sc.topological_ordering():
+        if isinstance(sl, CategoricalLayer):
+            partition, probs = _categorical_partition_and_probs(sl)
+            norm_sl = CategoricalLayer(
+                sl.scope,
+                sl.num_output_units,
+                num_categories=sl.num_categories,
+                probs=probs,
+            )
+            block = CircuitBlock.from_layer(norm_sl)
+            blocks.append(block)
+            layers_to_block[sl] = block
+            partitions[sl] = partition
+            continue
+
+        if isinstance(sl, ConstantValueLayer):
+            empty_layers.add(sl)
+            layers_to_block[sl] = None
+            partitions[sl] = _constant_partition(sl)
+            continue
+
+        if isinstance(sl, SumLayer):
+            if sl.arity != 1:
+                raise ValueError(
+                    "Only unary sum layers are supported by normalize, "
+                    f"found arity {sl.arity}"
+                )
+            (child,) = sc.layer_inputs(sl)
+            z_child = partitions[child]
+            if sl.weight.shape != (sl.num_output_units, sl.num_input_units):
+                raise ValueError(
+                    "Expected unary sum weights of shape "
+                    f"{(sl.num_output_units, sl.num_input_units)}, found {sl.weight.shape}"
+                )
+            if z_child.shape != (sl.num_input_units,):
+                raise ValueError(
+                    "Expected the child partition shape to be "
+                    f"{(sl.num_input_units,)}, found {z_child.shape}"
+                )
+            z_parent = Parameter.from_binary(
+                SumPartitionParameter(sl.weight.shape, z_child.shape),
+                sl.weight.ref(),
+                z_child,
+            )
+            partitions[sl] = z_parent
+            if child in empty_layers:
+                empty_layers.add(sl)
+                layers_to_block[sl] = None
+                continue
+            child_block = layers_to_block[child]
+            assert child_block is not None
+            weight = Parameter.from_binary(
+                NormalizeSumParameter(sl.weight.shape, z_child.shape),
+                sl.weight.ref(),
+                z_child,
+            )
+            norm_sl = SumLayer(
+                sl.num_input_units,
+                sl.num_output_units,
+                arity=1,
+                weight=weight,
+            )
+            block = CircuitBlock.from_layer(norm_sl)
+            blocks.append(block)
+            in_blocks[block] = [child_block]
+            layers_to_block[sl] = block
+            continue
+
+        if isinstance(sl, HadamardLayer):
+            children = list(sc.layer_inputs(sl))
+            partitions[sl] = _parameter_hadamard([partitions[child] for child in children])
+            surviving = [child for child in children if child not in empty_layers]
+            if not surviving:
+                empty_layers.add(sl)
+                layers_to_block[sl] = None
+                continue
+            surviving_blocks: list[CircuitBlock] = []
+            for child in surviving:
+                child_block = layers_to_block[child]
+                assert child_block is not None
+                surviving_blocks.append(child_block)
+            if len(surviving_blocks) == 1:
+                layers_to_block[sl] = surviving_blocks[0]
+                continue
+            norm_sl = HadamardLayer(sl.num_input_units, arity=len(surviving_blocks))
+            block = CircuitBlock.from_layer(norm_sl)
+            blocks.append(block)
+            in_blocks[block] = surviving_blocks
+            layers_to_block[sl] = block
+            continue
+
+        raise ValueError(f"Unsupported layer type {type(sl).__name__} for normalization")
+
+    output_blocks: list[CircuitBlock] = []
+    for sl in sc.outputs:
+        block = layers_to_block[sl]
+        if block is None:
+            raise ValueError("Cannot normalize a circuit with empty outputs")
+        output_blocks.append(block)
+
+    if not blocks:
+        raise ValueError("Cannot normalize a circuit with empty outputs")
+
+    norm_sc = Circuit.from_operation(
+        blocks,
+        in_blocks,
+        output_blocks,
+        operation=CircuitOperation(operator=CircuitOperator.NORMALIZATION, operands=(sc,)),
+    )
+    if not norm_sc.is_smooth or not norm_sc.is_decomposable:
+        raise StructuralPropertyError(
+            "The normalized circuit must be smooth and decomposable."
+        )
+    return norm_sc

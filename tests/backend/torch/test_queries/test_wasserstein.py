@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ from cirkit.backend.torch.compiler import TorchCompiler
 from cirkit.backend.torch.queries import CircuitWassersteinQuery
 from cirkit.backend.torch.wasserstein import HighsTransportSolver, circuit_wasserstein
 from cirkit.pipeline import PipelineContext
+from cirkit.symbolic import functional as SF
 from cirkit.symbolic.circuit import Circuit
 from cirkit.symbolic.initializers import ConstantTensorInitializer
 from cirkit.symbolic.layers import (
@@ -18,7 +20,8 @@ from cirkit.symbolic.layers import (
     KroneckerLayer,
     SumLayer,
 )
-from cirkit.symbolic.parameters import Parameter, SoftmaxParameter, TensorParameter
+from cirkit.symbolic.parameters import ConstantParameter, Parameter, SoftmaxParameter, TensorParameter
+from cirkit.templates import data_modalities, utils
 from cirkit.utils.scope import Scope
 
 
@@ -624,3 +627,57 @@ def test_query_preserves_cuda_device(fold: bool):
 
     assert value.device.type == "cuda"
     value.backward()
+
+
+def test_tabular_product_marginal_cw_and_r_theta_gradients() -> None:
+    torch.manual_seed(0)
+    num_features = 2
+    label_var = num_features
+    p = data_modalities.tabular_data(
+        region_graph="random-binary-tree",
+        num_features=num_features + 1,
+        input_layers={"name": "categorical", "args": {"num_categories": 2}},
+        num_input_units=2,
+        sum_product_layer="cp",
+        num_sum_units=2,
+        sum_weight_param=utils.Parameterization(activation="softmax", initialization="normal"),
+    )
+    r = deepcopy(p)
+    for layer in r.input_layers:
+        if layer.scope != Scope([label_var]):
+            continue
+        assert isinstance(layer, CategoricalLayer)
+        layer.probs = None
+        layer.logits = Parameter.from_input(
+            ConstantParameter(layer.num_output_units, layer.num_categories, value=0.0)
+        )
+
+    q = SF.normalize(SF.multiply(p, r))
+    p_x = SF.normalize(SF.integrate(p, scope=Scope([label_var])))
+    q_x = SF.normalize(SF.integrate(q, scope=Scope([label_var])))
+
+    ctx = PipelineContext(backend="torch", fold=False, optimize=False)
+    p_torch = ctx.compile(p)
+    r_torch = ctx.compile(r)
+    for parameter in p_torch.parameters():
+        parameter.requires_grad_(False)
+
+    query = CircuitWassersteinQuery(ctx.compile(p_x), ctx.compile(q_x))
+    value = query()
+    assert torch.isfinite(value)
+    value.backward()
+
+    r_gradients = [
+        parameter.grad
+        for parameter in r_torch.parameters()
+        if parameter.requires_grad
+    ]
+    assert r_gradients
+    assert any(
+        gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0.0
+        for gradient in r_gradients
+    )
+    assert all(
+        parameter.grad is None or parameter.grad.abs().sum() == 0.0
+        for parameter in p_torch.parameters()
+    )

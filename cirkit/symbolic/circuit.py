@@ -59,6 +59,8 @@ class CircuitOperator(IntEnum):
     """The multiplication operator defined over two circuits."""
     CONJUGATION = auto()
     """The conjugatation operator defined over a circuit computing a complex function."""
+    NORMALIZATION = auto()
+    """The normalization operator defined over a circuit."""
 
 
 @dataclass(frozen=True)

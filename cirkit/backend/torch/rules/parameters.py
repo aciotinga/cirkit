@@ -19,6 +19,7 @@ from cirkit.backend.torch.parameters.nodes import (
     TorchLogParameter,
     TorchLogSoftmaxParameter,
     TorchMixingWeightParameter,
+    TorchNormalizeSumParameter,
     TorchOuterProductParameter,
     TorchOuterSumParameter,
     TorchParameterNode,
@@ -33,6 +34,7 @@ from cirkit.backend.torch.parameters.nodes import (
     TorchSoftmaxParameter,
     TorchSoftplusParameter,
     TorchSquareParameter,
+    TorchSumPartitionParameter,
     TorchSumParameter,
     TorchTensorParameter,
 )
@@ -51,6 +53,7 @@ from cirkit.symbolic.parameters import (
     LogParameter,
     LogSoftmaxParameter,
     MixingWeightParameter,
+    NormalizeSumParameter,
     OuterProductParameter,
     OuterSumParameter,
     PolynomialDifferential,
@@ -64,6 +67,7 @@ from cirkit.symbolic.parameters import (
     SoftmaxParameter,
     SoftplusParameter,
     SquareParameter,
+    SumPartitionParameter,
     SumParameter,
     TensorParameter,
 )
@@ -132,6 +136,20 @@ def compile_hadamard_parameter(
 ) -> TorchHadamardParameter:
     in_shape1, in_shape2 = p.in_shapes
     return TorchHadamardParameter(in_shape1, in_shape2)
+
+
+def compile_sum_partition_parameter(
+    compiler: "TorchCompiler", p: SumPartitionParameter
+) -> TorchSumPartitionParameter:
+    in_shape1, in_shape2 = p.in_shapes
+    return TorchSumPartitionParameter(in_shape1, in_shape2)
+
+
+def compile_normalize_sum_parameter(
+    compiler: "TorchCompiler", p: NormalizeSumParameter
+) -> TorchNormalizeSumParameter:
+    in_shape1, in_shape2 = p.in_shapes
+    return TorchNormalizeSumParameter(in_shape1, in_shape2)
 
 
 def compile_kronecker_parameter(
@@ -285,6 +303,8 @@ DEFAULT_PARAMETER_COMPILATION_RULES: dict[
     IndexParameter: compile_index_parameter,
     SumParameter: compile_sum_parameter,
     HadamardParameter: compile_hadamard_parameter,
+    SumPartitionParameter: compile_sum_partition_parameter,
+    NormalizeSumParameter: compile_normalize_sum_parameter,
     KroneckerParameter: compile_kronecker_parameter,
     OuterProductParameter: compile_outer_product_parameter,
     OuterSumParameter: compile_outer_sum_parameter,

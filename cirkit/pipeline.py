@@ -293,6 +293,25 @@ class PipelineContext(AbstractContextManager, Generic[CompiledCircuitT]):
         conj_sc = SF.conjugate(sc, registry=self._op_registry)
         return self.compile(conj_sc)
 
+    def normalize(self, cc: CompiledCircuitT) -> CompiledCircuitT:
+        """Circuit normalization interface for compiled circuits.
+            See [normalize][cirkit.symbolic.functional.normalize] for more details.
+
+        Args:
+            cc: A compiled circuit.
+
+        Returns:
+            The circuit that encodes the normalization of the given compiled circuit.
+
+        Raises:
+            ValueError: if the given circuit has not been compiled in this context.
+        """
+        if not self._compiler.has_symbolic(cc):
+            raise ValueError("The given compiled circuit is not known in this pipeline")
+        sc = self._compiler.get_symbolic_circuit(cc)
+        norm_sc = SF.normalize(sc)
+        return self.compile(norm_sc)
+
 
 # pylint: disable-next=redefined-builtin
 def compile(sc: Circuit, ctx: PipelineContext[CompiledCircuitT] | None = None) -> CompiledCircuitT:
@@ -343,6 +362,14 @@ def conjugate(
     if ctx is None:
         ctx = _PIPELINE_CONTEXT.get()
     return ctx.conjugate(cc)
+
+
+def normalize(
+    cc: CompiledCircuitT, ctx: PipelineContext[CompiledCircuitT] | None = None
+) -> CompiledCircuitT:
+    if ctx is None:
+        ctx = _PIPELINE_CONTEXT.get()
+    return ctx.normalize(cc)
 
 
 def retrieve_compiler(backend: str, **backend_kwargs: Any) -> AbstractCompiler:

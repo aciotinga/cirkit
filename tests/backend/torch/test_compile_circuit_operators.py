@@ -9,7 +9,7 @@ from scipy import integrate
 
 from cirkit.backend.torch.circuits import TorchCircuit
 from cirkit.backend.torch.compiler import TorchCompiler
-from cirkit.backend.torch.layers.input import TorchEvidenceLayer
+from cirkit.backend.torch.layers.input import TorchConstantValueLayer, TorchEvidenceLayer
 from cirkit.backend.torch.semiring import SumProductSemiring
 from cirkit.symbolic import functional as SF
 from cirkit.symbolic.layers import PolynomialLayer
@@ -344,3 +344,57 @@ def test_compile_marginalize_monotonic_pc_gaussian():
     int_a, int_b = -np.inf, np.inf
     ig, err = integrate.quad(df, int_a, int_b)
     assert isclose(ig, gt_partition_func)
+
+
+def _to_sum_product(compiler: TorchCompiler, value: torch.Tensor) -> torch.Tensor:
+    return SumProductSemiring.map_from(value, compiler.semiring)
+
+
+@pytest.mark.parametrize(
+    "semiring,fold,optimize",
+    itertools.product(["sum-product", "lse-sum"], [False, True], [False, True]),
+)
+def test_compile_normalize_pc_categorical(semiring: str, fold: bool, optimize: bool):
+    torch.manual_seed(0)
+    compiler = TorchCompiler(semiring=semiring, fold=fold, optimize=optimize)
+    sc = build_multivariate_monotonic_structured_cpt_pc(
+        num_units=2,
+        input_layer="bernoulli",
+        product_layer="hadamard",
+        normalized=False,
+    )
+    assignments = torch.randint(0, 2, (16, 5))
+    original = compiler.compile(sc)
+    normalized_sc = SF.normalize(sc)
+    normalized = compiler.compile(normalized_sc)
+    partition = compiler.compile(SF.integrate(sc))
+    normalized_partition = compiler.compile(SF.integrate(normalized_sc))
+
+    original_scores = _to_sum_product(compiler, original(assignments))
+    normalized_scores = _to_sum_product(compiler, normalized(assignments))
+    partition_value = _to_sum_product(compiler, partition())
+    assert allclose(original_scores, normalized_scores * partition_value, rtol=1e-5, atol=1e-6)
+    assert allclose(
+        _to_sum_product(compiler, normalized_partition()),
+        torch.ones_like(partition_value),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert not any(isinstance(layer, TorchConstantValueLayer) for layer in normalized.layers)
+
+    marginalized_sc = SF.integrate(sc, scope=Scope([4]))
+    normalized_marginal_sc = SF.normalize(marginalized_sc)
+    marginalized_circuit = compiler.compile(marginalized_sc)
+    normalized_marginal_circuit = compiler.compile(normalized_marginal_sc)
+    remaining_partition = compiler.compile(SF.integrate(marginalized_sc))
+    remaining_partition_value = _to_sum_product(compiler, remaining_partition())
+    assert allclose(
+        _to_sum_product(compiler, marginalized_circuit(assignments)),
+        _to_sum_product(compiler, normalized_marginal_circuit(assignments))
+        * remaining_partition_value,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert not any(
+        isinstance(layer, TorchConstantValueLayer) for layer in normalized_marginal_circuit.layers
+    )

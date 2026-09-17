@@ -529,6 +529,64 @@ class TorchHadamardParameter(TorchBinaryParameterOp):
         return x1 * x2
 
 
+class TorchSumPartitionParameter(TorchBinaryParameterOp):
+    """Compute unary sum-layer partition vectors ``z_parent = W @ z_child``."""
+
+    def __init__(
+        self,
+        in_shape1: tuple[int, ...],
+        in_shape2: tuple[int, ...],
+        *,
+        num_folds: int = 1,
+    ) -> None:
+        if len(in_shape1) != 2:
+            raise ValueError(f"Expected a matrix weight shape, found {in_shape1}")
+        if in_shape2 != (in_shape1[1],):
+            raise ValueError(
+                "Expected the child partition shape to be "
+                f"{(in_shape1[1],)}, found {in_shape2}"
+            )
+        super().__init__(in_shape1, in_shape2, num_folds=num_folds)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (self.in_shape1[0],)
+
+    def forward(self, weight: Tensor, partition: Tensor) -> Tensor:
+        return torch.einsum("fij,fj->fi", weight, partition)
+
+
+class TorchNormalizeSumParameter(TorchBinaryParameterOp):
+    """Normalize unary sum weights as ``W[k, j] * z[j] / (W @ z)[k]``."""
+
+    def __init__(
+        self,
+        in_shape1: tuple[int, ...],
+        in_shape2: tuple[int, ...],
+        *,
+        num_folds: int = 1,
+    ) -> None:
+        if len(in_shape1) != 2:
+            raise ValueError(f"Expected a matrix weight shape, found {in_shape1}")
+        if in_shape2 != (in_shape1[1],):
+            raise ValueError(
+                "Expected the child partition shape to be "
+                f"{(in_shape1[1],)}, found {in_shape2}"
+            )
+        super().__init__(in_shape1, in_shape2, num_folds=num_folds)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.in_shape1
+
+    def forward(self, weight: Tensor, partition: Tensor) -> Tensor:
+        weighted = weight * partition.unsqueeze(1)
+        normalizer = weighted.sum(dim=2, keepdim=True)
+        if torch.any(normalizer <= 0.0):
+            raise ValueError("Cannot normalize a sum layer with a non-positive partition")
+        return weighted / normalizer
+
+
 class TorchKroneckerParameter(TorchBinaryParameterOp):
     """Kronecker product reparameterization."""
 

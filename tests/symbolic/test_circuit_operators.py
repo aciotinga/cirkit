@@ -5,7 +5,7 @@ from typing import TypeVar
 import pytest
 
 import cirkit.symbolic.functional as SF
-from cirkit.symbolic.circuit import are_compatible
+from cirkit.symbolic.circuit import Circuit, CircuitOperator, are_compatible
 from cirkit.symbolic.layers import (
     CategoricalLayer,
     ConstantValueLayer,
@@ -20,8 +20,10 @@ from cirkit.symbolic.parameters import (
     ConjugateParameter,
     ConstantParameter,
     KroneckerParameter,
+    NormalizeSumParameter,
     PolynomialDifferential,
     ReferenceParameter,
+    SoftmaxParameter,
 )
 from cirkit.utils.scope import Scope
 from tests.symbolic.test_utils import build_multivariate_monotonic_structured_cpt_pc
@@ -296,3 +298,83 @@ def test_symop_differentiate_circuit(num_units: int) -> None:
     dense_layers = list(filter(lambda l: isinstance(l, SumLayer), diff_sc.inner_layers))
     assert dense_layers
     # TODO: should we keep more info for diff layer ordering? i.e. testing order wrt each var
+
+
+def _assert_normalized_cp_circuit(norm_sc, *, scope: Scope) -> None:
+    assert norm_sc.scope == scope
+    assert norm_sc.is_smooth
+    assert norm_sc.is_decomposable
+    assert norm_sc.operation is not None
+    assert norm_sc.operation.operator == CircuitOperator.NORMALIZATION
+    assert not any(isinstance(layer, ConstantValueLayer) for layer in norm_sc.layers)
+    assert all(
+        isinstance(layer, (CategoricalLayer, SumLayer, HadamardLayer)) for layer in norm_sc.layers
+    )
+    assert all(isinstance(layer, CategoricalLayer) for layer in norm_sc.inputs)
+    assert all(
+        layer.probs is not None and isinstance(layer.probs.output, SoftmaxParameter)
+        for layer in norm_sc.inputs
+    )
+    assert all(layer.arity == 1 for layer in norm_sc.sum_layers)
+    assert all(isinstance(layer.weight.output, NormalizeSumParameter) for layer in norm_sc.sum_layers)
+
+
+@pytest.mark.parametrize("num_units", [1, 3])
+def test_symop_normalize_circuit(num_units: int) -> None:
+    sc = build_multivariate_monotonic_structured_cpt_pc(
+        num_units=num_units,
+        input_layer="bernoulli",
+        product_layer="hadamard",
+        normalized=False,
+    )
+    norm_sc = SF.normalize(sc)
+    _assert_normalized_cp_circuit(norm_sc, scope=sc.scope)
+
+
+@pytest.mark.parametrize("num_units", [1, 3])
+def test_symop_normalize_marginal_and_product_circuit(num_units: int) -> None:
+    sc = build_multivariate_monotonic_structured_cpt_pc(
+        num_units=num_units,
+        input_layer="bernoulli",
+        product_layer="hadamard",
+        normalized=False,
+    )
+    mar_sc = SF.integrate(sc, scope=Scope([4]))
+    assert any(isinstance(layer, ConstantValueLayer) for layer in mar_sc.layers)
+    norm_mar_sc = SF.normalize(mar_sc)
+    _assert_normalized_cp_circuit(norm_mar_sc, scope=Scope([0, 1, 2, 3]))
+
+    prod_sc = SF.multiply(sc, sc)
+    prod_mar_sc = SF.integrate(prod_sc, scope=Scope([4]))
+    norm_prod_mar_sc = SF.normalize(prod_mar_sc)
+    _assert_normalized_cp_circuit(norm_prod_mar_sc, scope=Scope([0, 1, 2, 3]))
+    assert are_compatible(norm_mar_sc, norm_prod_mar_sc)
+
+
+def test_symop_normalize_rejects_unsupported_circuits() -> None:
+    gaussian_sc = build_multivariate_monotonic_structured_cpt_pc(
+        num_units=1, input_layer="gaussian", product_layer="hadamard"
+    )
+    with pytest.raises(ValueError, match="Unsupported layer type"):
+        SF.normalize(gaussian_sc)
+
+    kronecker_sc = build_multivariate_monotonic_structured_cpt_pc(
+        num_units=1, input_layer="bernoulli", product_layer="kronecker"
+    )
+    with pytest.raises(ValueError, match="Unsupported layer type"):
+        SF.normalize(kronecker_sc)
+
+    leaf1 = CategoricalLayer(Scope([0]), 1, num_categories=2)
+    leaf2 = CategoricalLayer(Scope([0]), 1, num_categories=2)
+    nary_sum = SumLayer(1, 1, arity=2)
+    nary_sc = Circuit([leaf1, leaf2, nary_sum], {nary_sum: [leaf1, leaf2]}, [nary_sum])
+    with pytest.raises(ValueError, match="unary sum"):
+        SF.normalize(nary_sc)
+
+    empty_sc = SF.integrate(
+        build_multivariate_monotonic_structured_cpt_pc(
+            num_units=1, input_layer="bernoulli", product_layer="hadamard"
+        )
+    )
+    with pytest.raises(ValueError, match="empty outputs"):
+        SF.normalize(empty_sc)
