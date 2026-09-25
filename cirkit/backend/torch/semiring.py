@@ -367,19 +367,19 @@ class LSESumSemiring(SemiringImpl):
 
     @classmethod
     def sum(cls, x: Tensor, dim: int, *, keepdim: bool = False) -> Tensor:
-        return x.logsumexp(dim=dim, keepdim=keepdim).clamp_min(LOG_CLAMP_MIN)
+        return x.logsumexp(dim=dim, keepdim=keepdim)
 
     @classmethod
     def add(cls, *xs: Tensor) -> Tensor:
-        return functools.reduce(torch.logaddexp, xs).clamp_min(LOG_CLAMP_MIN)
+        return functools.reduce(torch.logaddexp, xs)
 
     @classmethod
     def prod(cls, x: Tensor, dim: int, *, keepdim: bool = False) -> Tensor:
-        return x.sum(dim=dim, keepdim=keepdim).clamp_min(LOG_CLAMP_MIN)
+        return x.sum(dim=dim, keepdim=keepdim)
 
     @classmethod
     def mul(cls, *xs: Tensor) -> Tensor:
-        return functools.reduce(torch.add, xs).clamp_min(LOG_CLAMP_MIN)
+        return functools.reduce(torch.add, xs)
 
     @classmethod
     def apply_reduce(

@@ -22,6 +22,7 @@ from cirkit.backend.torch.layers import (
     TorchLayer,
     TorchSumLayer,
 )
+from cirkit.backend.torch.layers.optimized import TorchCPTLayer
 from cirkit.backend.torch.parameters.nodes import TorchSoftmaxParameter, TorchTensorParameter
 from cirkit.utils.scope import Scope
 
@@ -438,6 +439,9 @@ class _FoldedCircuitWassersteinEngine:
                 if isinstance(layer1, TorchSumLayer):
                     assert isinstance(layer2, TorchSumLayer)
                     value = self._sum_matrix(layer1, layer2, children)
+                elif isinstance(layer1, TorchCPTLayer):
+                    assert isinstance(layer2, TorchCPTLayer)
+                    value = self._cpt_matrix(layer1, layer2, children)
                 else:
                     assert isinstance(layer1, (TorchHadamardLayer, TorchKroneckerLayer))
                     assert isinstance(layer2, (TorchHadamardLayer, TorchKroneckerLayer))
@@ -517,8 +521,26 @@ class _FoldedCircuitWassersteinEngine:
         if children.shape[1] != 1:
             raise RuntimeError("Aligned folded Circuit-Wasserstein requires unary sum layers")
         cost = children[:, 0]
-        weights1 = self._parameter(layer1, "weight")
-        weights2 = self._parameter(layer2, "weight")
+        return self._transport_with_weights(layer1, layer2, cost)
+
+    def _cpt_matrix(
+        self, layer1: TorchCPTLayer, layer2: TorchCPTLayer, children: Tensor
+    ) -> Tensor:
+        # CPT fuses Hadamard then unary sum: sum child costs, then OT on sum weights.
+        if children.shape[1] != layer1.arity or children.shape[1] != layer2.arity:
+            raise RuntimeError("Folded Circuit-Wasserstein CPT child arity mismatch")
+        cost = children.sum(dim=1)
+        return self._transport_with_weights(layer1, layer2, cost)
+
+    def _transport_with_weights(
+        self,
+        layer1: TorchSumLayer | TorchCPTLayer,
+        layer2: TorchSumLayer | TorchCPTLayer,
+        cost: Tensor,
+    ) -> Tensor:
+        # EM sum weights can drift slightly off the simplex; renormalize for OT.
+        weights1 = _normalize_probability_rows(self._parameter(layer1, "weight"))
+        weights2 = _normalize_probability_rows(self._parameter(layer2, "weight"))
         num_units1, num_units2 = weights1.shape[1], weights2.shape[1]
         return self.transport_solver(
             cost[:, None, None].expand(-1, num_units1, num_units2, -1, -1),
@@ -545,7 +567,8 @@ class _FoldedCircuitWassersteinEngine:
     def _categorical_probabilities(self, layer: TorchCategoricalLayer) -> Tensor:
         if layer.logits is not None:
             return torch.softmax(self._parameter(layer, "logits"), dim=-1)
-        return self._parameter(layer, "probs")
+        # EM / activation=none stores probabilities directly; renormalize float drift.
+        return _normalize_probability_rows(self._parameter(layer, "probs"))
 
     def _parameter(self, layer: TorchLayer, name: str) -> Tensor:
         value = layer.params[name]()
@@ -607,6 +630,9 @@ class _FoldedCircuitWassersteinEngine:
                         "Folded Circuit-Wasserstein currently requires unary sum layers; "
                         "compile with fold=False for general sum structures"
                     )
+            elif isinstance(layer1, TorchCPTLayer) and isinstance(layer2, TorchCPTLayer):
+                if layer1.arity != layer2.arity:
+                    raise ValueError("Paired folded CPT layers have different arities")
             elif isinstance(layer1, (TorchHadamardLayer, TorchKroneckerLayer)) and isinstance(
                 layer2, (TorchHadamardLayer, TorchKroneckerLayer)
             ):
@@ -1158,6 +1184,16 @@ class _CircuitWassersteinEngine:  # pylint: disable=too-many-instance-attributes
         if len(matched) != len(children2):
             raise ValueError("Products have different scope factorizations")
         return matched
+
+
+def _normalize_probability_rows(value: Tensor, eps: float = 1e-6) -> Tensor:
+    """Project rows onto the simplex.
+
+    Floors entries before renormalizing so EM float drift and near-dirac
+    sum weights stay numerically stable for the transport LP.
+    """
+    value = value.clamp(min=eps)
+    return value / value.sum(dim=-1, keepdim=True)
 
 
 def _validate_finite_nonnegative(value: Tensor, name: str) -> None:
